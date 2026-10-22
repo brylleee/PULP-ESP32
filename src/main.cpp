@@ -26,10 +26,14 @@ TaskHandle_t masterTaskHandle = NULL;
 TaskHandle_t feederTaskHandle = NULL;
 TaskHandle_t pulperTaskHandle = NULL;
 
+SystemState state;
+
 // Global States; Read by LCD, Written by Master) 
 char PININPUT[11];
 char confirmPIN[11];
 volatile byte pinIndex = 0; 
+
+bool SCAN_MODE = 0;
 
 enum SystemState {
   STATE_STANDBY,
@@ -125,14 +129,27 @@ void KeypadTask(void *pvParameters) {
 
 // TASK 3: INPUT FEEDER TASK
 void FeederTask(void *pvParameters) {
-  for (;;) {
-    // Sleep and wait for Master Task to trigger feeding
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    
-    // TODO: Add IR sensor checks and DC motor relay logic here
-    
-    vTaskDelay(pdMS_TO_TICKS(2000)); // Simulate feeding duration
+  // If we're actively taking in papers
+  if(state == STATE_PROCESSING) {
+    // Check if outer input feeder IR is blocked (paper in)
+    // Then roll the roller pins
+
+    // Stop if inner input feeder IR is blocked but not outer.
+    // It means: paper is about to go fully inside
+
+    // Take a picture
+    if(SCAN_MODE) {
+      // Turn on LED here...
+
+      sendNmea0183(Serial, "SCAN");
+
+      // Then await ACK here...
+
+      // Then move the conveyor belt one full cycle.
+    }
   }
+
+  vTaskDelay(pdMS_TO_TICKS(2000));
 }
 
 // TASK 4: PULPER TASK
@@ -151,7 +168,7 @@ void sendLcd(LcdScreen screen) {
 
 // TASK 5: MASTER ORCHESTRATION TASK
 void MasterTask(void *pvParameters) {
-  SystemState state = STATE_STANDBY;
+  state = STATE_STANDBY;
   sendLcd(SCREEN_STANDBY);
   char key;
 
@@ -179,6 +196,7 @@ void MasterTask(void *pvParameters) {
             memset(PININPUT, 0, sizeof(PININPUT));
             state = STATE_INPUT_PIN;
             sendLcd(SCREEN_INPUT_PIN);
+            SCAN_MODE = 1;
           } else if (key == '2') { // Shred Only (Bypass Crypto)
             state = STATE_PROCESSING;
             sendLcd(SCREEN_SHREDDING);
@@ -216,9 +234,8 @@ void MasterTask(void *pvParameters) {
               confirmPIN[10] = '\0';
               if (strcmp(PININPUT, confirmPIN) == 0) {
                 sendLcd(SCREEN_PIN_SUCCESS);
-                // Transmit PIN to RPi ("Hermes") over UART
-                Serial.print("PIN_SET:");
-                Serial.println(PININPUT);
+                // Transmit PIN to RPi over UART
+                sendNmea0183(Serial, "SCANMODE", PININPUT);
                 
                 // Zeroize PIN in RAM immediately after transmission
                 memset(PININPUT, 0, sizeof(PININPUT));
