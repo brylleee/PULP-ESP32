@@ -26,8 +26,6 @@ TaskHandle_t masterTaskHandle = NULL;
 TaskHandle_t feederTaskHandle = NULL;
 TaskHandle_t pulperTaskHandle = NULL;
 
-SystemState state;
-
 // Global States; Read by LCD, Written by Master) 
 char PININPUT[11];
 char confirmPIN[11];
@@ -55,6 +53,8 @@ enum LcdScreen {
   SCREEN_PULPING,
   SCREEN_DONE
 };
+
+SystemState state;
 
 // TASK 1: I2C LCD TASK
 void LcdTask(void *pvParameters) {
@@ -129,27 +129,30 @@ void KeypadTask(void *pvParameters) {
 
 // TASK 3: INPUT FEEDER TASK
 void FeederTask(void *pvParameters) {
-  // If we're actively taking in papers
-  if(state == STATE_PROCESSING) {
-    // Check if outer input feeder IR is blocked (paper in)
-    // Then roll the roller pins
+  for(;;) {
+    // If we're actively taking in papers
+    if(state == STATE_PROCESSING) {
+      // Check if outer input feeder IR is blocked (paper in)
+      // Then roll the roller pins
 
-    // Stop if inner input feeder IR is blocked but not outer.
-    // It means: paper is about to go fully inside
+      // Stop if inner input feeder IR is blocked but not outer.
+      // It means: paper is about to go fully inside
 
-    // Take a picture
-    if(SCAN_MODE) {
-      // Turn on LED here...
+      // Take a picture
+      if(SCAN_MODE) {
+        // Turn on LED here...
 
-      sendNmea0183(Serial, "SCAN");
+        sendNmea0183(Serial, "SCAN");
 
-      // Then await ACK here...
+        // Waits for ACK...
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-      // Then move the conveyor belt one full cycle.
+        // Then move the conveyor belt one full cycle.
+      }
     }
-  }
 
-  vTaskDelay(pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
 }
 
 // TASK 4: PULPER TASK
@@ -259,16 +262,40 @@ void MasterTask(void *pvParameters) {
           break;
           
         case STATE_PROCESSING:
+          // User presses 'D' to indicate they are done feeding the batch of papers
+          if (key == 'D') { 
+            if (SCAN_MODE) {
+              // Tell the Raspberry Pi to close the file/session
+              sendNmea0183(Serial, "SCAN_DONE");
+            }
+            
+            // Visual feedback
+            sendLcd(SCREEN_DONE);
+            vTaskDelay(pdMS_TO_TICKS(2000)); // Show "Done" for 2 seconds
+            
+            // Go back to sleep
+            state = STATE_STANDBY;
+            sendLcd(SCREEN_STANDBY);
+          }
           break;
       }
     }
 
-    // Serial comms with Raspberry Pi
+    // Serial comms from Raspberry Pi
     if (Serial.available()) {
       String command = Serial.readStringUntil('\n');
-      command.trim();
+      NmeaNode *nmea = parseNmea0183(command.c_str());
+
+      if(nmea == NULL) continue;
+
+      std::string cmd = nmea->token.c_str();
       
-      // Parse comms here
+      // Tells ESP32 an individual page scan is successful
+      if(cmd == "SCAN_ACK") {
+        xTaskNotifyGive(feederTaskHandle);
+      }
+
+      delete nmea;
     }
   }
 }
