@@ -9,8 +9,8 @@ LiquidCrystal_I2C lcd(0x27, 16, 4);
 const byte rows = 4;
 const byte columns = 4;
 
-byte rowpins[rows] = {4, 5, 6, 7};
-byte columnpins[columns] = {15, 16, 17, 18};
+byte rowpins[rows] = {15, 16, 17, 18};
+byte columnpins[columns] = {4, 5, 6, 7};
 char keys[rows][columns] = {
   {'1', '2', '3', 'A'},
   {'4', '5', '6', 'B'},
@@ -120,6 +120,7 @@ void KeypadTask(void *pvParameters) {
   for (;;) {
     key = keypad.getKey();
     if (key) {
+      Serial.println(key);
       xQueueSend(keyQueue, &key, 0);
     }
 
