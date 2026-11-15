@@ -2,6 +2,8 @@
 #include "Wire.h"
 #include "LiquidCrystal_I2C.h"
 
+// #include <ESP32Servo.h>  // Door servo; also uncomment lib_deps in platformio.ini
+
 #include "nmea-parser.h"
 
 #include "ir_breakbeam.h"
@@ -27,20 +29,25 @@ Keypad keypad = Keypad(makeKeymap(keys), rowpins, columnpins, rows, columns);
 
 QueueHandle_t keyQueue;
 QueueHandle_t lcdQueue;
-SemaphoreHandle_t scanTriggerSem;   // Given by Master on SCAN_TRIGGER_KEY, taken by Feeder
-const char SCAN_TRIGGER_KEY = 'C';  // Temporary manual trigger until the IR logic is in
+SemaphoreHandle_t scanTriggerSem;   // Master gives on SCAN_TRIGGER_KEY, Feeder takes
+const char SCAN_TRIGGER_KEY = 'C';  // Temporary manual trigger until IR logic is in
 
-// Serial ports (ARDUINO_USB_CDC_ON_BOOT=1):
-//   Serial  - native USB (OTG) port
-//   Serial0 - UART0, GPIO43/44, hard-wired to the DevKitC "UART" USB bridge.
-//             Kept for PC monitoring only: the bridge drives GPIO44, so a Pi
-//             wired there can't be heard (its SCAN_ACK gets drowned out).
-//   Serial1 - UART1 on its own pins, dedicated to the Raspberry Pi.
+// Serial  - native USB
+// Serial0 - GPIO43/44, wired to the DevKitC "UART" USB bridge: PC monitoring
+//           only (the bridge drives GPIO44, drowning out a Pi wired there)
+// Serial1 - Raspberry Pi link
 const uint8_t PI_UART_TX_PIN = 11;  // -> Pi RX (GPIO15)
 const uint8_t PI_UART_RX_PIN = 12;  // <- Pi TX (GPIO14)
 
-// Build the frame once (same message ID) and send it to the Pi and both
-// monitoring ports.
+const uint8_t SCAN_FLASH_PIN = 13;  // OUT: white LED flash transistor, HIGH = on during scan session
+
+// Pulper pins (not used yet)
+const uint8_t PULPER_RELAY_PIN = 14;  // OUT: relay module, HIGH = pulper on
+const uint8_t PULPER_SERVO_PIN = 21;  // OUT: door servo signal
+const uint8_t WATER_LEVEL_PIN = 8;    // IN:  level sensor, INPUT_PULLUP (switch to GND)
+const uint8_t WATER_PUMP_PIN = 39;    // OUT: pump MOSFET/relay, HIGH = on
+
+// Send one frame (same message ID) to the Pi and both monitoring ports.
 template <typename... Args>
 uint32_t sendToPi(const std::string& cmd, const Args&... args) {
   uint32_t id = 0;
@@ -55,20 +62,19 @@ TaskHandle_t masterTaskHandle = NULL;
 TaskHandle_t feederTaskHandle = NULL;
 TaskHandle_t pulperTaskHandle = NULL;
 
-// Global States; Read by LCD, Written by Master)
+// Global state: written by Master, read by LCD
 char PININPUT[11];
 char confirmPIN[11];
 volatile byte pinIndex = 0;
-volatile uint16_t pagesScanned = 0;  // Pages confirmed by the Pi this session (read by LCD)
+volatile uint16_t pagesScanned = 0;  // Pages the Pi confirmed this session
 
 bool SCAN_MODE = 0;
 
-// What the Pi answered to a SCAN, passed from Master to Feeder as the task
-// notification value.
+// Pi's reply to SCAN, sent to Feeder as a task notification value.
 enum PiReply : uint32_t {
   PI_REPLY_NONE = 0,
   PI_REPLY_ACK = 1,   // SCAN_ACK: page captured
-  PI_REPLY_NACK = 2   // NACK: the Pi failed the page
+  PI_REPLY_NACK = 2   // NACK: page failed
 };
 
 enum SystemState {
@@ -88,8 +94,8 @@ enum LcdScreen {
   SCREEN_PIN_ERR,
   SCREEN_SCAN_READY,   // Waiting for the first page
   SCREEN_SCANNING,     // Pi is capturing a page
-  SCREEN_PAGE_DONE,    // Page captured: next page or finish
-  SCREEN_SCAN_ERR,     // Pi failed the page: retry or finish
+  SCREEN_PAGE_DONE,    // Page captured: next or finish
+  SCREEN_SCAN_ERR,     // Page failed: retry or finish
   SCREEN_SHREDDING,
   SCREEN_PULPING,
   SCREEN_DONE
@@ -192,47 +198,38 @@ void KeypadTask(void *pvParameters) {
 // TASK 3: INPUT FEEDER TASK
 void FeederTask(void *pvParameters) {
   for(;;) {
-    // Beam check: spam while blocked, stay silent while the beam is hitting.
+    // Flash on for the whole scan session, off within one poll after D / A.
+    digitalWrite(SCAN_FLASH_PIN, (state == STATE_PROCESSING && SCAN_MODE) ? HIGH : LOW);
+
+    // Beam check: print while blocked.
     //if (!irBeamPresent()) {
     //  Serial.println("BLOCKED");
     //}
 
-    // If we're actively taking in papers
     if(state == STATE_PROCESSING) {
-      // Check if outer input feeder IR is blocked (paper in)
-      // Then roll the roller pins
+      // TODO: outer feeder IR blocked (paper in) -> run rollers.
+      // Stop when inner IR is blocked but outer isn't (paper almost fully in).
 
-      // Stop if inner input feeder IR is blocked but not outer.
-      // It means: paper is about to go fully inside
-
-      // Take a picture
       if(SCAN_MODE) {
-        // Turn on LED here...
-
-        // -- WAIT CONFIRMATION HERE
-        // Temporary: wait for SCAN_TRIGGER_KEY. Times out each poll so the task
-        // notices if the session is cancelled/finished. Replace with IR logic.
+        // Temporary: wait for SCAN_TRIGGER_KEY (replace with IR logic).
+        // Short timeout so a cancelled/finished session is noticed.
         if (xSemaphoreTake(scanTriggerSem, pdMS_TO_TICKS(FEEDER_POLL_MS)) != pdTRUE) {
           continue;
         }
 
-        // Drop any stale notification (e.g. the wake-up give from Master) so
-        // the wait below really waits for this page's SCAN_ACK.
+        // Clear stale notifications so we wait for this page's reply.
         xTaskNotifyWait(0, 0xFFFFFFFF, NULL, 0);
 
         sendToPi("SCAN");
         sendLcd(SCREEN_SCANNING);
 
-        // Wait for SCAN_ACK (or NACK if the Pi failed the page). No timeout.
-        // Only bail out if the session is ended (D / A) so the feeder isn't
-        // left stuck waiting for a page that no longer matters.
+        // Wait for SCAN_ACK / NACK, no timeout; bail only if the session ends.
         uint32_t reply = PI_REPLY_NONE;
         while (xTaskNotifyWait(0, 0xFFFFFFFF, &reply, pdMS_TO_TICKS(FEEDER_POLL_MS)) != pdTRUE) {
           if (state != STATE_PROCESSING || !SCAN_MODE) break;
         }
 
-        // Only update the screen if the session is still running; after D / A
-        // Master owns the LCD.
+        // After D / A, Master owns the LCD.
         if (state == STATE_PROCESSING && SCAN_MODE) {
           if (reply == PI_REPLY_ACK) {
             pagesScanned++;
@@ -242,7 +239,7 @@ void FeederTask(void *pvParameters) {
           }
         }
 
-        // Then move the conveyor belt one full cycle.
+        // TODO: move the conveyor one full cycle.
       }
     }
 
@@ -250,13 +247,57 @@ void FeederTask(void *pvParameters) {
   }
 }
 
+// Door servo (not used yet). Two positions only; write() jumps straight to
+// the angle, so the door snaps across at full servo speed.
+// Servo doorServo;
+// const uint8_t DOOR_CLOSED_ANGLE = 0;
+// const uint8_t DOOR_OPEN_ANGLE = 90;   // Tune to door travel
+// const uint32_t DOOR_TRAVEL_MS = 500;  // Full-swing time; tune to servo
+//
+// void doorOpen()  { doorServo.write(DOOR_OPEN_ANGLE); }
+// void doorClose() { doorServo.write(DOOR_CLOSED_ANGLE); }
+//
+// // Open, hold, close.
+// void doorCycle(uint32_t holdMs) {
+//   doorOpen();
+//   vTaskDelay(pdMS_TO_TICKS(DOOR_TRAVEL_MS + holdMs));
+//   doorClose();
+//   vTaskDelay(pdMS_TO_TICKS(DOOR_TRAVEL_MS));
+// }
+
+// Water fill (not used yet).
+// const bool WATER_FULL_LEVEL = LOW;             // Sensor reading when full; flip if inverted
+// const uint32_t WATER_FILL_TIMEOUT_MS = 30000;  // Safety cutoff (dry reservoir / stuck sensor)
+//
+// bool waterIsFull() { return digitalRead(WATER_LEVEL_PIN) == WATER_FULL_LEVEL; }
+//
+// // Pump until full or timeout. Returns true if filled.
+// bool fillWater() {
+//   uint32_t start = millis();
+//   digitalWrite(WATER_PUMP_PIN, HIGH);
+//   while (!waterIsFull() && millis() - start < WATER_FILL_TIMEOUT_MS) {
+//     vTaskDelay(pdMS_TO_TICKS(50));
+//   }
+//   digitalWrite(WATER_PUMP_PIN, LOW);
+//   return waterIsFull();
+// }
+
 // TASK 4: PULPER TASK
 void PulperTask(void *pvParameters) {
   for (;;) {
-    // Sleep and wait for Master Task to trigger pulping
+    // Wait for Master to trigger pulping
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    vTaskDelay(pdMS_TO_TICKS(3000)); // Simulate pulping duration
+    // TODO: pulper hardware
+    // if (!fillWater()) {
+    //   // Didn't fill: skip pulping / show error
+    // }
+    // digitalWrite(PULPER_RELAY_PIN, HIGH);   // Pulper on
+
+    vTaskDelay(pdMS_TO_TICKS(3000)); // Simulated pulping
+
+    // digitalWrite(PULPER_RELAY_PIN, LOW);    // Pulper off
+    // doorCycle(1000);                         // Open, hold 1s, close
   }
 }
 
@@ -264,7 +305,7 @@ void sendLcd(LcdScreen screen) {
   xQueueSend(lcdQueue, &screen, portMAX_DELAY);
 }
 
-// Read one NMEA line from a Pi port, if any, and act on it.
+// Read and handle one NMEA line from a Pi port, if any.
 void handlePiPort(Stream &port) {
   if (!port.available()) return;
 
@@ -272,13 +313,12 @@ void handlePiPort(Stream &port) {
   NmeaNode *nmea = parseNmea0183(command.c_str());
   if (nmea == NULL) return;
 
-  // Tells ESP32 an individual page scan is successful
+  // Page scanned OK
   if (nmea->token == "SCAN_ACK") {
     xTaskNotify(feederTaskHandle, PI_REPLY_ACK, eSetValueWithOverwrite);
   }
 
-  // The Pi refused this page: release the feeder so the user can retry
-  // instead of leaving it blocked on a SCAN_ACK that will never come.
+  // Page failed: release Feeder so the user can retry
   else if (nmea->token == "NACK") {
     xTaskNotify(feederTaskHandle, PI_REPLY_NACK, eSetValueWithOverwrite);
   }
@@ -293,7 +333,6 @@ void MasterTask(void *pvParameters) {
   char key;
 
   for (;;) {
-    // Process Keypad Queue
     if (xQueueReceive(keyQueue, &key, pdMS_TO_TICKS(10))) {
 
       if (key == 'A') { // Global cancel button
@@ -355,19 +394,16 @@ void MasterTask(void *pvParameters) {
               confirmPIN[10] = '\0';
               if (strcmp(PININPUT, confirmPIN) == 0) {
                 sendLcd(SCREEN_PIN_SUCCESS);
-                // Transmit PIN to RPi over UART
                 sendToPi("SCANMODE", PININPUT);
 
-                // Zeroize PIN in RAM immediately after transmission
+                // Wipe the PIN from RAM right after sending
                 memset(PININPUT, 0, sizeof(PININPUT));
                 memset(confirmPIN, 0, sizeof(confirmPIN));
 
                 vTaskDelay(pdMS_TO_TICKS(1500));
                 pagesScanned = 0;
                 state = STATE_PROCESSING;
-
-                // Feeder now waits for C; tell the user what to do.
-                sendLcd(SCREEN_SCAN_READY);
+                sendLcd(SCREEN_SCAN_READY);  // Feeder now waits for C
 
               } else {
                 sendLcd(SCREEN_PIN_ERR);
@@ -380,24 +416,21 @@ void MasterTask(void *pvParameters) {
           break;
 
         case STATE_PROCESSING:
-          // Temporary manual trigger: tell Feeder to scan the current page
+          // Temporary manual trigger: scan current page
           if (key == SCAN_TRIGGER_KEY && SCAN_MODE) {
             xSemaphoreGive(scanTriggerSem);
           }
 
-          // User presses 'D' to indicate they are done feeding the batch of papers
+          // D: done feeding this batch
           if (key == 'D') {
             if (SCAN_MODE) {
-              // Tell the Raspberry Pi to close the file/session
-              sendToPi("SCAN_DONE");
+              sendToPi("SCAN_DONE");  // Pi closes the file/session
             }
             SCAN_MODE = 0;
 
-            // Visual feedback
             sendLcd(SCREEN_DONE);
-            vTaskDelay(pdMS_TO_TICKS(2000)); // Show "Done" for 2 seconds
+            vTaskDelay(pdMS_TO_TICKS(2000));
 
-            // Go back to sleep
             state = STATE_STANDBY;
             sendLcd(SCREEN_STANDBY);
           }
@@ -405,8 +438,7 @@ void MasterTask(void *pvParameters) {
       }
     }
 
-    // Serial comms from Raspberry Pi (Serial1). USB and the UART bridge are
-    // also accepted so replies can be typed in from a PC while testing.
+    // Pi replies on Serial1; USB / UART bridge also accepted for PC testing.
     handlePiPort(Serial1);
     handlePiPort(Serial);
     handlePiPort(Serial0);
@@ -415,8 +447,22 @@ void MasterTask(void *pvParameters) {
 
 void setup() {
   Serial.begin(115200);
-  Serial0.begin(115200);  // UART0 default pins 43/44 -> "UART" USB port (monitoring)
+  Serial0.begin(115200);  // "UART" USB port (monitoring)
   Serial1.begin(115200, SERIAL_8N1, PI_UART_RX_PIN, PI_UART_TX_PIN);  // Pi link
+
+  pinMode(SCAN_FLASH_PIN, OUTPUT);
+  digitalWrite(SCAN_FLASH_PIN, LOW);
+
+  // Pulper (not used yet); all outputs start off, door closed
+  // pinMode(PULPER_RELAY_PIN, OUTPUT);
+  // digitalWrite(PULPER_RELAY_PIN, LOW);
+  // ESP32PWM::allocateTimer(1);               // Avoid LEDC timer 0 (IR TX carrier)
+  // doorServo.setPeriodHertz(50);
+  // doorServo.attach(PULPER_SERVO_PIN, 500, 2500);  // 500-2500us pulse range
+  // doorServo.write(DOOR_CLOSED_ANGLE);
+  // pinMode(WATER_LEVEL_PIN, INPUT_PULLUP);
+  // pinMode(WATER_PUMP_PIN, OUTPUT);
+  // digitalWrite(WATER_PUMP_PIN, LOW);
 
   irInit();
 
@@ -435,4 +481,4 @@ void setup() {
   xTaskCreatePinnedToCore(MasterTask, "MasterTask", 4096, NULL, 2, &masterTaskHandle, 1);
 }
 
-void loop() { vTaskDelete(NULL); }
+void loop() { vTaskDelete(NULL); }
