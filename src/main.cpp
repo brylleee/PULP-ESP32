@@ -41,13 +41,29 @@ const uint8_t PI_UART_RX_PIN = 12;  // <- Pi TX (GPIO14)
 
 const uint8_t SCAN_FLASH_PIN = 13;  // OUT: white LED flash transistor, HIGH = on during scan session
 
-// Conveyor (scan mode). Paper at the entrance starts the belt; the Pi decides
-// when to stop or adjust it over the NMEA link (CONV_STOP / CONV_RUN / CONV_SPEED).
+// Conveyor. The ESP32 runs the belt; in scan mode the Pi only pauses it
+// (CONV_PAUSE) when the page is framed for the camera.
 const uint8_t ENTRANCE_IR_PIN = 40;    // IN:  TCRT5000 OUT, LOW = paper at feeder entrance
 const uint8_t CONVEYOR_ENA_PIN = 41;   // OUT: motor driver ENA, PWM duty = belt speed
 const uint8_t CONVEYOR_DEFAULT_SPEED = 100;     // analogWrite duty (0-255)
-const uint32_t CONVEYOR_TIMEOUT_MS = 10000;     // Safety stop if the Pi never says stop
+const uint32_t CONVEYOR_TIMEOUT_MS = 10000;     // Safety stop if the Pi never pauses a feed
+const uint32_t CONVEYOR_EJECT_MS = 5000;        // Belt run that carries a page on to the shredder
 const uint8_t ENTRANCE_DEBOUNCE_POLLS = 3;      // Consecutive LOW reads before paper counts as present
+
+enum BeltMode { BELT_OFF, BELT_FEED, BELT_EJECT };
+// Events sent to ConveyorTask
+enum ConveyorEvent : uint8_t {
+  CONV_EVT_PAUSE,  // Pi: page is framed, stop feeding
+  CONV_EVT_EJECT   // Page scanned: carry it on to the shredder
+};
+
+// Shredder. Each page (scan ACK, or paper fed in shred-only) runs it for
+// SHREDDER_ON_MS, then it rests SHREDDER_REST_MS. A page during the run
+// restarts the run; a page during the rest runs it again once the rest ends.
+// Ending a session (D or A) adds one more run to clear the chamber.
+const uint8_t SHREDDER_RELAY_PIN = 42;  // OUT: shredder relay, HIGH = on
+const uint32_t SHREDDER_ON_MS = 5000;
+const uint32_t SHREDDER_REST_MS = 3000;
 
 // Pulper pins (not used yet)
 const uint8_t PULPER_RELAY_PIN = 14;  // OUT: relay module, HIGH = pulper on
@@ -56,7 +72,7 @@ const uint8_t WATER_LEVEL_PIN = 8;    // IN:  level sensor, INPUT_PULLUP (switch
 const uint8_t WATER_PUMP_PIN = 39;    // OUT: pump MOSFET/relay, HIGH = on
 
 SemaphoreHandle_t piTxMutex;         // Several tasks send to the Pi; keep frames whole
-QueueHandle_t conveyorCmdQueue;      // Pi conveyor commands (duty 0-255, 0 = stop) -> ConveyorTask
+QueueHandle_t conveyorEvtQueue;      // ConveyorEvent -> ConveyorTask
 
 // Send one frame (same message ID) to the Pi and both monitoring ports.
 template <typename... Args>
@@ -95,7 +111,8 @@ enum SystemState {
   STATE_MENU,
   STATE_INPUT_PIN,
   STATE_CONFIRM_PIN,
-  STATE_PROCESSING
+  STATE_PROCESSING,
+  STATE_FINISHING      // D pressed: final shred / pulp, keys wait
 };
 
 enum LcdScreen {
@@ -109,6 +126,7 @@ enum LcdScreen {
   SCREEN_SCANNING,     // Pi is capturing a page
   SCREEN_PAGE_DONE,    // Page captured: next or finish
   SCREEN_SCAN_ERR,     // Page failed: retry or finish
+  SCREEN_FEED_READY,   // Shred-only: feed pages, D to finish
   SCREEN_SHREDDING,
   SCREEN_PULPING,
   SCREEN_DONE
@@ -117,6 +135,7 @@ enum LcdScreen {
 SystemState state;
 
 void sendLcd(LcdScreen screen);
+void shredderKick();
 
 // TASK 1: I2C LCD TASK
 void LcdTask(void *pvParameters) {
@@ -170,6 +189,10 @@ void LcdTask(void *pvParameters) {
         case SCREEN_SCAN_ERR:
           lcd.setCursor(0, 0); lcd.print("Failed. Pages:"); lcd.print(pagesScanned);
           lcd.setCursor(0, 1); lcd.print("C:Retry D:Finish");
+          break;
+        case SCREEN_FEED_READY:
+          lcd.setCursor(0, 0); lcd.print("Insert paper");
+          lcd.setCursor(0, 1); lcd.print("D:Finish");
           break;
         case SCREEN_SHREDDING:
           lcd.setCursor(0, 0); lcd.print("[=] PULP Status:");
@@ -239,13 +262,15 @@ void FeederTask(void *pvParameters) {
         if (state == STATE_PROCESSING && SCAN_MODE) {
           if (reply == PI_REPLY_ACK) {
             pagesScanned++;
+            // Page captured: belt carries it on and the shredder runs
+            uint8_t evt = CONV_EVT_EJECT;
+            xQueueSend(conveyorEvtQueue, &evt, 0);
+            shredderKick();
             sendLcd(SCREEN_PAGE_DONE);
           } else if (reply == PI_REPLY_NACK) {
             sendLcd(SCREEN_SCAN_ERR);
           }
         }
-
-        // TODO: move the conveyor one full cycle.
       }
     }
 
@@ -253,54 +278,144 @@ void FeederTask(void *pvParameters) {
   }
 }
 
+// Shredder request/phase, shared between tasks under shredMux.
+enum ShredPhase { SHRED_IDLE, SHRED_ON, SHRED_REST };
+portMUX_TYPE shredMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool shredRequest = false;  // Run wanted; cleared when the run actually starts
+volatile ShredPhase shredPhase = SHRED_IDLE;
+
+// Ask for a shredder run (any task).
+void shredderKick() {
+  taskENTER_CRITICAL(&shredMux);
+  shredRequest = true;
+  taskEXIT_CRITICAL(&shredMux);
+}
+
+// True while a run is pending or in progress (the rest doesn't count).
+bool shredderBusy() {
+  taskENTER_CRITICAL(&shredMux);
+  bool busy = shredRequest || shredPhase == SHRED_ON;
+  taskEXIT_CRITICAL(&shredMux);
+  return busy;
+}
+
+// TASK 3c: SHREDDER TASK
+void ShredderTask(void *pvParameters) {
+  uint32_t phaseStartMs = 0;
+
+  for (;;) {
+    uint32_t now = millis();
+
+    taskENTER_CRITICAL(&shredMux);
+    if (shredPhase == SHRED_REST && now - phaseStartMs >= SHREDDER_REST_MS) {
+      shredPhase = SHRED_IDLE;
+    }
+    if (shredRequest && shredPhase != SHRED_REST) {
+      // Start, or restart the 5 s if already running
+      shredRequest = false;
+      shredPhase = SHRED_ON;
+      phaseStartMs = now;
+    } else if (shredPhase == SHRED_ON && now - phaseStartMs >= SHREDDER_ON_MS) {
+      shredPhase = SHRED_REST;
+      phaseStartMs = now;
+    }
+    bool on = shredPhase == SHRED_ON;
+    taskEXIT_CRITICAL(&shredMux);
+
+    digitalWrite(SHREDDER_RELAY_PIN, on ? HIGH : LOW);
+    vTaskDelay(pdMS_TO_TICKS(FEEDER_POLL_MS));
+  }
+}
+
 // TASK 3b: CONVEYOR TASK
-// Scan mode only. Paper arriving at the entrance starts the belt and tells the
-// Pi (CONV_START); from then on the Pi stops/adjusts it. Safety timeout if not.
+// Scan mode, per page:
+//   1. Paper arrives at the entrance: belt FEEDs, ESP32 sends CONV_START.
+//   2. Pi sends CONV_PAUSE when the page is framed: belt stops, page held.
+//      No CONV_PAUSE within CONVEYOR_TIMEOUT_MS: belt stops, CONV_TIMEOUT sent.
+//   3. Page scanned (SCAN_ACK): belt EJECTs for CONVEYOR_EJECT_MS to the shredder.
+//   A page arriving while one is held or ejecting is fed once the eject ends.
+// Shred-only: each page arriving EJECTs (restarting the run) and starts the shredder.
+// D lets a running eject finish; A stops the belt at once.
 bool paperAtEntrance() { return digitalRead(ENTRANCE_IR_PIN) == LOW; }
 
 void setConveyor(uint8_t duty) { analogWrite(CONVEYOR_ENA_PIN, duty); }
 
 void ConveyorTask(void *pvParameters) {
-  bool running = false;
+  BeltMode mode = BELT_OFF;
+  bool pageInFrame = false;   // Scan: Pi paused on a page; hold it until scanned
+  bool feedPending = false;   // Scan: next page arrived while busy; feed it after the eject
   bool paperWasPresent = false;
   uint8_t presentPolls = 0;
   uint32_t runStartMs = 0;
-  uint8_t duty;
+  uint8_t evt;
+
+  auto setMode = [&](BeltMode m) {
+    mode = m;
+    runStartMs = millis();
+    setConveyor(m == BELT_OFF ? 0 : CONVEYOR_DEFAULT_SPEED);
+  };
+  auto startFeed = [&]() {
+    setMode(BELT_FEED);
+    sendToPi("CONV_START");
+  };
 
   for (;;) {
-    if (!(state == STATE_PROCESSING && SCAN_MODE)) {
-      // Outside a scan session: belt off, forget stale state and commands.
-      if (running) { setConveyor(0); running = false; }
-      paperWasPresent = false;  // Paper already waiting starts the belt next session
+    bool active = state == STATE_PROCESSING;
+    bool finishingEject = state == STATE_FINISHING && mode == BELT_EJECT;
+
+    if (!active && !finishingEject) {
+      // Outside a session: belt off, forget stale state and events.
+      if (mode != BELT_OFF) setMode(BELT_OFF);
+      pageInFrame = false;
+      feedPending = false;
+      paperWasPresent = false;  // Paper already waiting is fed next session
       presentPolls = 0;
-      while (xQueueReceive(conveyorCmdQueue, &duty, 0) == pdTRUE) {}
+      while (xQueueReceive(conveyorEvtQueue, &evt, 0) == pdTRUE) {}
       vTaskDelay(pdMS_TO_TICKS(FEEDER_POLL_MS));
       continue;
     }
 
-    // Pi commands: stop, resume, change speed. Each run command restarts the timeout.
-    while (xQueueReceive(conveyorCmdQueue, &duty, 0) == pdTRUE) {
-      setConveyor(duty);
-      running = duty > 0;
-      runStartMs = millis();
+    if (active) {
+      bool scanMode = SCAN_MODE;
+
+      while (xQueueReceive(conveyorEvtQueue, &evt, 0) == pdTRUE) {
+        if (!scanMode) continue;
+        if (evt == CONV_EVT_PAUSE && mode == BELT_FEED) {
+          setMode(BELT_OFF);
+          pageInFrame = true;
+        } else if (evt == CONV_EVT_EJECT) {
+          setMode(BELT_EJECT);
+          pageInFrame = false;
+        }
+      }
+
+      // Debounced entrance sensor; act only on paper arriving.
+      presentPolls = paperAtEntrance() ? min<uint8_t>(presentPolls + 1, ENTRANCE_DEBOUNCE_POLLS) : 0;
+      bool paperPresent = presentPolls >= ENTRANCE_DEBOUNCE_POLLS;
+      if (paperPresent && !paperWasPresent) {
+        if (!scanMode) {
+          setMode(BELT_EJECT);  // Shred-only: straight through to the shredder
+          shredderKick();
+        } else if (mode == BELT_OFF && !pageInFrame) {
+          startFeed();
+        } else if (mode != BELT_FEED) {
+          feedPending = true;   // Page held or ejecting: feed this one afterwards
+        }
+      }
+      paperWasPresent = paperPresent;
     }
 
-    // Debounced entrance sensor; start only on paper arriving, so a page the
-    // Pi already stopped doesn't restart the belt.
-    presentPolls = paperAtEntrance() ? min<uint8_t>(presentPolls + 1, ENTRANCE_DEBOUNCE_POLLS) : 0;
-    bool paperPresent = presentPolls >= ENTRANCE_DEBOUNCE_POLLS;
-    if (paperPresent && !paperWasPresent && !running) {
-      setConveyor(CONVEYOR_DEFAULT_SPEED);
-      running = true;
-      runStartMs = millis();
-      sendToPi("CONV_START");
-    }
-    paperWasPresent = paperPresent;
-
-    if (running && millis() - runStartMs >= CONVEYOR_TIMEOUT_MS) {
-      setConveyor(0);
-      running = false;
+    uint32_t elapsedMs = millis() - runStartMs;
+    if (mode == BELT_FEED && elapsedMs >= CONVEYOR_TIMEOUT_MS) {
+      setMode(BELT_OFF);
       sendToPi("CONV_TIMEOUT");
+    } else if (mode == BELT_EJECT && elapsedMs >= CONVEYOR_EJECT_MS) {
+      if (feedPending && active && SCAN_MODE) {
+        feedPending = false;
+        startFeed();
+      } else {
+        setMode(BELT_OFF);
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(FEEDER_POLL_MS));
@@ -345,7 +460,7 @@ void ConveyorTask(void *pvParameters) {
 // TASK 4: PULPER TASK
 void PulperTask(void *pvParameters) {
   for (;;) {
-    // Wait for Master to trigger pulping
+    // Wait for the Pi's PULP command
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
     // TODO: pulper hardware
@@ -355,6 +470,7 @@ void PulperTask(void *pvParameters) {
     // digitalWrite(PULPER_RELAY_PIN, HIGH);   // Pulper on
 
     vTaskDelay(pdMS_TO_TICKS(3000)); // Simulated pulping
+    sendToPi("PULP_DONE");
 
     // digitalWrite(PULPER_RELAY_PIN, LOW);    // Pulper off
     // doorCycle(1000);                         // Open, hold 1s, close
@@ -383,17 +499,15 @@ void handlePiPort(Stream &port) {
     xTaskNotify(feederTaskHandle, PI_REPLY_NACK, eSetValueWithOverwrite);
   }
 
-  // Conveyor control: $CONV_STOP,<id> / $CONV_RUN,<id> / $CONV_SPEED,<id>,<0-255>
-  else if (nmea->token == "CONV_STOP" || nmea->token == "CONV_RUN" || nmea->token == "CONV_SPEED") {
-    uint8_t duty = 0;
-    if (nmea->token == "CONV_RUN") {
-      duty = CONVEYOR_DEFAULT_SPEED;
-    } else if (nmea->token == "CONV_SPEED") {
-      NmeaNode *arg = nmea->next ? nmea->next->next : NULL;  // Skip message ID
-      if (arg == NULL) { freeNmeaList(nmea); return; }
-      duty = (uint8_t)constrain(atoi(arg->token.c_str()), 0, 255);
-    }
-    xQueueSend(conveyorCmdQueue, &duty, 0);
+  // Page is framed for the camera: pause the belt
+  else if (nmea->token == "CONV_PAUSE") {
+    uint8_t evt = CONV_EVT_PAUSE;
+    xQueueSend(conveyorEvtQueue, &evt, 0);
+  }
+
+  // Run the pulper (only on the Pi's request for now)
+  else if (nmea->token == "PULP") {
+    xTaskNotifyGive(pulperTaskHandle);
   }
 
   freeNmeaList(nmea);
@@ -410,6 +524,9 @@ void MasterTask(void *pvParameters) {
 
       // Global cancel, except during PIN entry where A is a PIN character
       if (key == 'A' && state != STATE_INPUT_PIN && state != STATE_CONFIRM_PIN) {
+        if (state == STATE_PROCESSING) {
+          shredderKick();  // Extra run to clear paper already fed; runs in the background
+        }
         SCAN_MODE = 0;
         state = STATE_STANDBY;
         sendLcd(SCREEN_STANDBY);
@@ -431,15 +548,10 @@ void MasterTask(void *pvParameters) {
             state = STATE_INPUT_PIN;
             sendLcd(SCREEN_INPUT_PIN);
             SCAN_MODE = 1;
-          } else if (key == '2') { // Shred Only (Bypass Crypto)
+          } else if (key == '2') { // Shred Only (Bypass Crypto): feed pages, D to finish
+            SCAN_MODE = 0;
             state = STATE_PROCESSING;
-            sendLcd(SCREEN_SHREDDING);
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            xTaskNotifyGive(pulperTaskHandle); // Trigger Pulper
-            sendLcd(SCREEN_PULPING);
-            vTaskDelay(pdMS_TO_TICKS(3500));
-            state = STATE_STANDBY;
-            sendLcd(SCREEN_STANDBY);
+            sendLcd(SCREEN_FEED_READY);
           }
           break;
 
@@ -508,6 +620,14 @@ void MasterTask(void *pvParameters) {
               sendToPi("SCAN_DONE");  // Pi closes the file/session
             }
             SCAN_MODE = 0;
+            state = STATE_FINISHING;  // Flash off; conveyor stops after any eject in progress
+
+            // Final shredder run to clear the chamber (waits out a rest if one is running)
+            shredderKick();
+            sendLcd(SCREEN_SHREDDING);
+            while (shredderBusy()) {
+              vTaskDelay(pdMS_TO_TICKS(50));
+            }
 
             sendLcd(SCREEN_DONE);
             vTaskDelay(pdMS_TO_TICKS(2000));
@@ -538,6 +658,9 @@ void setup() {
   pinMode(CONVEYOR_ENA_PIN, OUTPUT);
   setConveyor(0);
 
+  pinMode(SHREDDER_RELAY_PIN, OUTPUT);
+  digitalWrite(SHREDDER_RELAY_PIN, LOW);
+
   // Pulper (not used yet); all outputs start off, door closed
   // pinMode(PULPER_RELAY_PIN, OUTPUT);
   // digitalWrite(PULPER_RELAY_PIN, LOW);
@@ -559,11 +682,12 @@ void setup() {
   lcdQueue = xQueueCreate(10, sizeof(LcdScreen));
   scanTriggerSem = xSemaphoreCreateBinary();
   piTxMutex = xSemaphoreCreateMutex();
-  conveyorCmdQueue = xQueueCreate(8, sizeof(uint8_t));
+  conveyorEvtQueue = xQueueCreate(8, sizeof(uint8_t));
 
   xTaskCreatePinnedToCore(LcdTask, "LcdTask", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(KeypadTask, "KeypadTask", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(FeederTask, "FeederTask", 4096, NULL, 1, &feederTaskHandle, 1);
+  xTaskCreatePinnedToCore(ShredderTask, "ShredderTask", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(ConveyorTask, "ConveyorTask", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(PulperTask, "PulperTask", 4096, NULL, 1, &pulperTaskHandle, 1);
   xTaskCreatePinnedToCore(MasterTask, "MasterTask", 4096, NULL, 2, &masterTaskHandle, 1);
