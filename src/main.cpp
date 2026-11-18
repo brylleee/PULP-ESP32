@@ -8,7 +8,7 @@
 
 #include "ir_breakbeam.h"
 
-LiquidCrystal_I2C lcd(0x27, 16, 4);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 const byte rows = 4;
 const byte columns = 4;
@@ -41,11 +41,22 @@ const uint8_t PI_UART_RX_PIN = 12;  // <- Pi TX (GPIO14)
 
 const uint8_t SCAN_FLASH_PIN = 13;  // OUT: white LED flash transistor, HIGH = on during scan session
 
+// Conveyor (scan mode). Paper at the entrance starts the belt; the Pi decides
+// when to stop or adjust it over the NMEA link (CONV_STOP / CONV_RUN / CONV_SPEED).
+const uint8_t ENTRANCE_IR_PIN = 40;    // IN:  TCRT5000 OUT, LOW = paper at feeder entrance
+const uint8_t CONVEYOR_ENA_PIN = 41;   // OUT: motor driver ENA, PWM duty = belt speed
+const uint8_t CONVEYOR_DEFAULT_SPEED = 100;     // analogWrite duty (0-255)
+const uint32_t CONVEYOR_TIMEOUT_MS = 10000;     // Safety stop if the Pi never says stop
+const uint8_t ENTRANCE_DEBOUNCE_POLLS = 3;      // Consecutive LOW reads before paper counts as present
+
 // Pulper pins (not used yet)
 const uint8_t PULPER_RELAY_PIN = 14;  // OUT: relay module, HIGH = pulper on
 const uint8_t PULPER_SERVO_PIN = 21;  // OUT: door servo signal
 const uint8_t WATER_LEVEL_PIN = 8;    // IN:  level sensor, INPUT_PULLUP (switch to GND)
 const uint8_t WATER_PUMP_PIN = 39;    // OUT: pump MOSFET/relay, HIGH = on
+
+SemaphoreHandle_t piTxMutex;         // Several tasks send to the Pi; keep frames whole
+QueueHandle_t conveyorCmdQueue;      // Pi conveyor commands (duty 0-255, 0 = stop) -> ConveyorTask
 
 // Send one frame (same message ID) to the Pi and both monitoring ports.
 template <typename... Args>
@@ -53,9 +64,11 @@ uint32_t sendToPi(const std::string& cmd, const Args&... args) {
   uint32_t id = 0;
   std::string frame = buildNmea0183(&id, cmd, args...);
   const uint8_t *data = reinterpret_cast<const uint8_t*>(frame.c_str());
+  xSemaphoreTake(piTxMutex, portMAX_DELAY);
   Serial1.write(data, frame.length());
   Serial.write(data, frame.length());
   Serial0.write(data, frame.length());
+  xSemaphoreGive(piTxMutex);
   return id;
 }
 TaskHandle_t masterTaskHandle = NULL;
@@ -112,15 +125,15 @@ void LcdTask(void *pvParameters) {
   for (;;) {
     if (xQueueReceive(lcdQueue, &currentScreen, portMAX_DELAY)) {
       lcd.clear();
+      // 16x2 display: rows 0-1, max 16 chars per row
       switch (currentScreen) {
         case SCREEN_STANDBY:
-          lcd.setCursor(2, 1); lcd.print("[=] PULP Status:");
-          lcd.setCursor(4, 2); lcd.print("Standby");
+          lcd.setCursor(0, 0); lcd.print("[=] PULP Status:");
+          lcd.setCursor(4, 1); lcd.print("Standby");
           break;
         case SCREEN_MENU:
-          lcd.setCursor(0, 0); lcd.print("Select mode:");
-          lcd.setCursor(0, 1); lcd.print("[1] Scan & Shred");
-          lcd.setCursor(0, 2); lcd.print("[2] Shred only");
+          lcd.setCursor(0, 0); lcd.print("[1] Scan & Shred");
+          lcd.setCursor(0, 1); lcd.print("[2] Shred only");
           break;
         case SCREEN_INPUT_PIN:
           lcd.setCursor(0, 0); lcd.print("Input Your PIN:");
@@ -137,45 +150,38 @@ void LcdTask(void *pvParameters) {
           }
           break;
         case SCREEN_PIN_SUCCESS:
-          lcd.setCursor(1, 1); lcd.print("PIN Confirmed!");
+          lcd.setCursor(1, 0); lcd.print("PIN Confirmed!");
           break;
         case SCREEN_PIN_ERR:
-          lcd.setCursor(2, 1); lcd.print("PINs Don't Match");
+          lcd.setCursor(0, 0); lcd.print("PINs Don't Match");
           break;
         case SCREEN_SCAN_READY:
-          lcd.setCursor(0, 0); lcd.print("Ready to scan");
-          lcd.setCursor(0, 1); lcd.print("Insert paper");
-          lcd.setCursor(0, 2); lcd.print("C: Scan page");
-          lcd.setCursor(0, 3); lcd.print("D: Finish");
+          lcd.setCursor(0, 0); lcd.print("Insert paper");
+          lcd.setCursor(0, 1); lcd.print("C:Scan D:Finish");
           break;
         case SCREEN_SCANNING:
-          lcd.setCursor(0, 0); lcd.print("Scanning...");
-          lcd.setCursor(0, 1); lcd.print("Page "); lcd.print(pagesScanned + 1);
-          lcd.setCursor(0, 2); lcd.print("Please wait");
+          lcd.setCursor(0, 0); lcd.print("Scanning page "); lcd.print(pagesScanned + 1);
+          lcd.setCursor(0, 1); lcd.print("Please wait...");
           break;
         case SCREEN_PAGE_DONE:
           lcd.setCursor(0, 0); lcd.print("Page "); lcd.print(pagesScanned); lcd.print(" scanned!");
-          lcd.setCursor(0, 1); lcd.print("Insert next page");
-          lcd.setCursor(0, 2); lcd.print("C: Scan next");
-          lcd.setCursor(0, 3); lcd.print("D: Finish");
+          lcd.setCursor(0, 1); lcd.print("C:Next D:Finish");
           break;
         case SCREEN_SCAN_ERR:
-          lcd.setCursor(0, 0); lcd.print("Scan failed!");
-          lcd.setCursor(0, 1); lcd.print("Pages so far: "); lcd.print(pagesScanned);
-          lcd.setCursor(0, 2); lcd.print("C: Retry");
-          lcd.setCursor(0, 3); lcd.print("D: Finish");
+          lcd.setCursor(0, 0); lcd.print("Failed. Pages:"); lcd.print(pagesScanned);
+          lcd.setCursor(0, 1); lcd.print("C:Retry D:Finish");
           break;
         case SCREEN_SHREDDING:
-          lcd.setCursor(2, 1); lcd.print("[=] PULP Status:");
-          lcd.setCursor(4, 2); lcd.print("Shredding");
+          lcd.setCursor(0, 0); lcd.print("[=] PULP Status:");
+          lcd.setCursor(4, 1); lcd.print("Shredding");
           break;
         case SCREEN_PULPING:
-          lcd.setCursor(2, 1); lcd.print("[=] PULP Status:");
-          lcd.setCursor(4, 2); lcd.print("Pulping");
+          lcd.setCursor(0, 0); lcd.print("[=] PULP Status:");
+          lcd.setCursor(4, 1); lcd.print("Pulping");
           break;
         case SCREEN_DONE:
-          lcd.setCursor(2, 1); lcd.print("[=] PULP Status:");
-          lcd.setCursor(6, 2); lcd.print("Done");
+          lcd.setCursor(0, 0); lcd.print("[=] PULP Status:");
+          lcd.setCursor(6, 1); lcd.print("Done");
           break;
       }
     }
@@ -188,6 +194,7 @@ void KeypadTask(void *pvParameters) {
   for (;;) {
     key = keypad.getKey();
     if (key) {
+      Serial.println(key);
       xQueueSend(keyQueue, &key, 0);
     }
 
@@ -207,8 +214,7 @@ void FeederTask(void *pvParameters) {
     //}
 
     if(state == STATE_PROCESSING) {
-      // TODO: outer feeder IR blocked (paper in) -> run rollers.
-      // Stop when inner IR is blocked but outer isn't (paper almost fully in).
+      // Belt movement is handled by ConveyorTask.
 
       if(SCAN_MODE) {
         // Temporary: wait for SCAN_TRIGGER_KEY (replace with IR logic).
@@ -241,6 +247,60 @@ void FeederTask(void *pvParameters) {
 
         // TODO: move the conveyor one full cycle.
       }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(FEEDER_POLL_MS));
+  }
+}
+
+// TASK 3b: CONVEYOR TASK
+// Scan mode only. Paper arriving at the entrance starts the belt and tells the
+// Pi (CONV_START); from then on the Pi stops/adjusts it. Safety timeout if not.
+bool paperAtEntrance() { return digitalRead(ENTRANCE_IR_PIN) == LOW; }
+
+void setConveyor(uint8_t duty) { analogWrite(CONVEYOR_ENA_PIN, duty); }
+
+void ConveyorTask(void *pvParameters) {
+  bool running = false;
+  bool paperWasPresent = false;
+  uint8_t presentPolls = 0;
+  uint32_t runStartMs = 0;
+  uint8_t duty;
+
+  for (;;) {
+    if (!(state == STATE_PROCESSING && SCAN_MODE)) {
+      // Outside a scan session: belt off, forget stale state and commands.
+      if (running) { setConveyor(0); running = false; }
+      paperWasPresent = false;  // Paper already waiting starts the belt next session
+      presentPolls = 0;
+      while (xQueueReceive(conveyorCmdQueue, &duty, 0) == pdTRUE) {}
+      vTaskDelay(pdMS_TO_TICKS(FEEDER_POLL_MS));
+      continue;
+    }
+
+    // Pi commands: stop, resume, change speed. Each run command restarts the timeout.
+    while (xQueueReceive(conveyorCmdQueue, &duty, 0) == pdTRUE) {
+      setConveyor(duty);
+      running = duty > 0;
+      runStartMs = millis();
+    }
+
+    // Debounced entrance sensor; start only on paper arriving, so a page the
+    // Pi already stopped doesn't restart the belt.
+    presentPolls = paperAtEntrance() ? min<uint8_t>(presentPolls + 1, ENTRANCE_DEBOUNCE_POLLS) : 0;
+    bool paperPresent = presentPolls >= ENTRANCE_DEBOUNCE_POLLS;
+    if (paperPresent && !paperWasPresent && !running) {
+      setConveyor(CONVEYOR_DEFAULT_SPEED);
+      running = true;
+      runStartMs = millis();
+      sendToPi("CONV_START");
+    }
+    paperWasPresent = paperPresent;
+
+    if (running && millis() - runStartMs >= CONVEYOR_TIMEOUT_MS) {
+      setConveyor(0);
+      running = false;
+      sendToPi("CONV_TIMEOUT");
     }
 
     vTaskDelay(pdMS_TO_TICKS(FEEDER_POLL_MS));
@@ -323,6 +383,19 @@ void handlePiPort(Stream &port) {
     xTaskNotify(feederTaskHandle, PI_REPLY_NACK, eSetValueWithOverwrite);
   }
 
+  // Conveyor control: $CONV_STOP,<id> / $CONV_RUN,<id> / $CONV_SPEED,<id>,<0-255>
+  else if (nmea->token == "CONV_STOP" || nmea->token == "CONV_RUN" || nmea->token == "CONV_SPEED") {
+    uint8_t duty = 0;
+    if (nmea->token == "CONV_RUN") {
+      duty = CONVEYOR_DEFAULT_SPEED;
+    } else if (nmea->token == "CONV_SPEED") {
+      NmeaNode *arg = nmea->next ? nmea->next->next : NULL;  // Skip message ID
+      if (arg == NULL) { freeNmeaList(nmea); return; }
+      duty = (uint8_t)constrain(atoi(arg->token.c_str()), 0, 255);
+    }
+    xQueueSend(conveyorCmdQueue, &duty, 0);
+  }
+
   freeNmeaList(nmea);
 }
 
@@ -335,7 +408,8 @@ void MasterTask(void *pvParameters) {
   for (;;) {
     if (xQueueReceive(keyQueue, &key, pdMS_TO_TICKS(10))) {
 
-      if (key == 'A') { // Global cancel button
+      // Global cancel, except during PIN entry where A is a PIN character
+      if (key == 'A' && state != STATE_INPUT_PIN && state != STATE_CONFIRM_PIN) {
         SCAN_MODE = 0;
         state = STATE_STANDBY;
         sendLcd(SCREEN_STANDBY);
@@ -370,7 +444,8 @@ void MasterTask(void *pvParameters) {
           break;
 
         case STATE_INPUT_PIN:
-          if (key >= '0' && key <= '9' && pinIndex < 10) {
+          // Any key counts (0-9, A-D, *, #); all 10 must be entered
+          if (pinIndex < 10) {
             PININPUT[pinIndex++] = key;
             sendLcd(SCREEN_INPUT_PIN);
 
@@ -386,7 +461,7 @@ void MasterTask(void *pvParameters) {
           break;
 
         case STATE_CONFIRM_PIN:
-          if (key >= '0' && key <= '9' && pinIndex < 10) {
+          if (pinIndex < 10) {
             confirmPIN[pinIndex++] = key;
             sendLcd(SCREEN_CONFIRM_PIN);
 
@@ -394,11 +469,17 @@ void MasterTask(void *pvParameters) {
               confirmPIN[10] = '\0';
               if (strcmp(PININPUT, confirmPIN) == 0) {
                 sendLcd(SCREEN_PIN_SUCCESS);
-                sendToPi("SCANMODE", PININPUT);
+                // Hex-encode: '*' is the NMEA checksum delimiter and would break the frame
+                char pinHex[21];
+                for (int i = 0; i < 10; i++) {
+                  snprintf(&pinHex[i * 2], 3, "%02X", (uint8_t)PININPUT[i]);
+                }
+                sendToPi("SCANMODE", pinHex);
 
                 // Wipe the PIN from RAM right after sending
                 memset(PININPUT, 0, sizeof(PININPUT));
                 memset(confirmPIN, 0, sizeof(confirmPIN));
+                memset(pinHex, 0, sizeof(pinHex));
 
                 vTaskDelay(pdMS_TO_TICKS(1500));
                 pagesScanned = 0;
@@ -453,6 +534,10 @@ void setup() {
   pinMode(SCAN_FLASH_PIN, OUTPUT);
   digitalWrite(SCAN_FLASH_PIN, LOW);
 
+  pinMode(ENTRANCE_IR_PIN, INPUT);  // TCRT5000 module drives its own output
+  pinMode(CONVEYOR_ENA_PIN, OUTPUT);
+  setConveyor(0);
+
   // Pulper (not used yet); all outputs start off, door closed
   // pinMode(PULPER_RELAY_PIN, OUTPUT);
   // digitalWrite(PULPER_RELAY_PIN, LOW);
@@ -473,12 +558,15 @@ void setup() {
   keyQueue = xQueueCreate(10, sizeof(char));
   lcdQueue = xQueueCreate(10, sizeof(LcdScreen));
   scanTriggerSem = xSemaphoreCreateBinary();
+  piTxMutex = xSemaphoreCreateMutex();
+  conveyorCmdQueue = xQueueCreate(8, sizeof(uint8_t));
 
   xTaskCreatePinnedToCore(LcdTask, "LcdTask", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(KeypadTask, "KeypadTask", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(FeederTask, "FeederTask", 4096, NULL, 1, &feederTaskHandle, 1);
+  xTaskCreatePinnedToCore(ConveyorTask, "ConveyorTask", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(PulperTask, "PulperTask", 4096, NULL, 1, &pulperTaskHandle, 1);
   xTaskCreatePinnedToCore(MasterTask, "MasterTask", 4096, NULL, 2, &masterTaskHandle, 1);
 }
 
-void loop() { vTaskDelete(NULL); }
+void loop() { vTaskDelete(NULL); }
