@@ -29,8 +29,8 @@ Keypad keypad = Keypad(makeKeymap(keys), rowpins, columnpins, rows, columns);
 
 QueueHandle_t keyQueue;
 QueueHandle_t lcdQueue;
-SemaphoreHandle_t scanTriggerSem;   // Master gives on SCAN_TRIGGER_KEY, Feeder takes
-const char SCAN_TRIGGER_KEY = 'C';  // Temporary manual trigger until IR logic is in
+SemaphoreHandle_t scanTriggerSem;   // Given on CONV_PAUSE (or the manual key), Feeder takes
+const char SCAN_TRIGGER_KEY = 'C';  // Manual scan fallback: after a failed scan or a missed page
 
 // Serial  - native USB
 // Serial0 - GPIO43/44, wired to the DevKitC "UART" USB bridge: PC monitoring
@@ -123,6 +123,8 @@ enum LcdScreen {
   SCREEN_PIN_SUCCESS,
   SCREEN_PIN_ERR,
   SCREEN_SCAN_READY,   // Waiting for the first page
+  SCREEN_FEEDING,      // Belt bringing a page under the camera
+  SCREEN_NOT_FOUND,    // Belt timed out: the Pi never saw the page centred
   SCREEN_SCANNING,     // Pi is capturing a page
   SCREEN_PAGE_DONE,    // Page captured: next or finish
   SCREEN_SCAN_ERR,     // Page failed: retry or finish
@@ -176,6 +178,14 @@ void LcdTask(void *pvParameters) {
           break;
         case SCREEN_SCAN_READY:
           lcd.setCursor(0, 0); lcd.print("Insert paper");
+          lcd.setCursor(0, 1); lcd.print("D:Finish");
+          break;
+        case SCREEN_FEEDING:
+          lcd.setCursor(0, 0); lcd.print("Feeding page "); lcd.print(pagesScanned + 1);
+          lcd.setCursor(0, 1); lcd.print("D:Finish");
+          break;
+        case SCREEN_NOT_FOUND:
+          lcd.setCursor(0, 0); lcd.print("Page not found");
           lcd.setCursor(0, 1); lcd.print("C:Scan D:Finish");
           break;
         case SCREEN_SCANNING:
@@ -184,7 +194,7 @@ void LcdTask(void *pvParameters) {
           break;
         case SCREEN_PAGE_DONE:
           lcd.setCursor(0, 0); lcd.print("Page "); lcd.print(pagesScanned); lcd.print(" scanned!");
-          lcd.setCursor(0, 1); lcd.print("C:Next D:Finish");
+          lcd.setCursor(0, 1); lcd.print("D:Finish");
           break;
         case SCREEN_SCAN_ERR:
           lcd.setCursor(0, 0); lcd.print("Failed. Pages:"); lcd.print(pagesScanned);
@@ -240,8 +250,8 @@ void FeederTask(void *pvParameters) {
       // Belt movement is handled by ConveyorTask.
 
       if(SCAN_MODE) {
-        // Temporary: wait for SCAN_TRIGGER_KEY (replace with IR logic).
-        // Short timeout so a cancelled/finished session is noticed.
+        // Wait for the page to be stopped under the camera (CONV_PAUSE), or
+        // the manual key. Short timeout so a cancelled/finished session is noticed.
         if (xSemaphoreTake(scanTriggerSem, pdMS_TO_TICKS(FEEDER_POLL_MS)) != pdTRUE) {
           continue;
         }
@@ -330,7 +340,8 @@ void ShredderTask(void *pvParameters) {
 // TASK 3b: CONVEYOR TASK
 // Scan mode, per page:
 //   1. Paper arrives at the entrance: belt FEEDs, ESP32 sends CONV_START.
-//   2. Pi sends CONV_PAUSE when the page is framed: belt stops, page held.
+//   2. Pi sends CONV_PAUSE when the page is centred: belt stops (at once, in
+//      handlePiPort), page held, and the Feeder is told to SCAN it.
 //      No CONV_PAUSE within CONVEYOR_TIMEOUT_MS: belt stops, CONV_TIMEOUT sent.
 //   3. Page scanned (SCAN_ACK): belt EJECTs for CONVEYOR_EJECT_MS to the shredder.
 //   A page arriving while one is held or ejecting is fed once the eject ends.
@@ -339,6 +350,10 @@ void ShredderTask(void *pvParameters) {
 bool paperAtEntrance() { return digitalRead(ENTRANCE_IR_PIN) == LOW; }
 
 void setConveyor(uint8_t duty) { analogWrite(CONVEYOR_ENA_PIN, duty); }
+
+// True while the belt feeds a page towards the camera; lets CONV_PAUSE cut the
+// motor straight from handlePiPort without waiting for the next poll.
+volatile bool beltFeeding = false;
 
 void ConveyorTask(void *pvParameters) {
   BeltMode mode = BELT_OFF;
@@ -351,12 +366,14 @@ void ConveyorTask(void *pvParameters) {
 
   auto setMode = [&](BeltMode m) {
     mode = m;
+    beltFeeding = m == BELT_FEED;
     runStartMs = millis();
     setConveyor(m == BELT_OFF ? 0 : CONVEYOR_DEFAULT_SPEED);
   };
   auto startFeed = [&]() {
     setMode(BELT_FEED);
     sendToPi("CONV_START");
+    sendLcd(SCREEN_FEEDING);
   };
 
   for (;;) {
@@ -383,6 +400,7 @@ void ConveyorTask(void *pvParameters) {
         if (evt == CONV_EVT_PAUSE && mode == BELT_FEED) {
           setMode(BELT_OFF);
           pageInFrame = true;
+          xSemaphoreGive(scanTriggerSem);  // Page centred: scan it
         } else if (evt == CONV_EVT_EJECT) {
           setMode(BELT_EJECT);
           pageInFrame = false;
@@ -409,6 +427,7 @@ void ConveyorTask(void *pvParameters) {
     if (mode == BELT_FEED && elapsedMs >= CONVEYOR_TIMEOUT_MS) {
       setMode(BELT_OFF);
       sendToPi("CONV_TIMEOUT");
+      sendLcd(SCREEN_NOT_FOUND);
     } else if (mode == BELT_EJECT && elapsedMs >= CONVEYOR_EJECT_MS) {
       if (feedPending && active && SCAN_MODE) {
         feedPending = false;
@@ -499,8 +518,10 @@ void handlePiPort(Stream &port) {
     xTaskNotify(feederTaskHandle, PI_REPLY_NACK, eSetValueWithOverwrite);
   }
 
-  // Page is framed for the camera: pause the belt
+  // Page is centred under the camera: stop the belt now (timing matters),
+  // then let ConveyorTask hold the page and trigger the scan.
   else if (nmea->token == "CONV_PAUSE") {
+    if (beltFeeding) setConveyor(0);
     uint8_t evt = CONV_EVT_PAUSE;
     xQueueSend(conveyorEvtQueue, &evt, 0);
   }
@@ -596,7 +617,7 @@ void MasterTask(void *pvParameters) {
                 vTaskDelay(pdMS_TO_TICKS(1500));
                 pagesScanned = 0;
                 state = STATE_PROCESSING;
-                sendLcd(SCREEN_SCAN_READY);  // Feeder now waits for C
+                sendLcd(SCREEN_SCAN_READY);  // Waits for paper at the entrance
 
               } else {
                 sendLcd(SCREEN_PIN_ERR);
@@ -609,7 +630,8 @@ void MasterTask(void *pvParameters) {
           break;
 
         case STATE_PROCESSING:
-          // Temporary manual trigger: scan current page
+          // Manual scan of whatever is under the camera (fallback only: the
+          // LCD offers it after a failed scan or when the Pi missed the page)
           if (key == SCAN_TRIGGER_KEY && SCAN_MODE) {
             xSemaphoreGive(scanTriggerSem);
           }

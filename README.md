@@ -12,7 +12,7 @@ ESP32-S3 controller for PULP, a paper shredder and pulper that can scan pages fi
 ├───┼───┼───┼───┤
 │ 4 │ 5 │ 6 │ B │   B = not used
 ├───┼───┼───┼───┤
-│ 7 │ 8 │ 9 │ C │   C = Scan page (scan mode only)
+│ 7 │ 8 │ 9 │ C │   C = Manual scan (only when a scan fails or a page is missed)
 ├───┼───┼───┼───┤
 │ * │ 0 │ # │ D │   # = Open menu (from standby)
 └───┴───┴───┴───┘   D = Finish (scan mode)
@@ -76,24 +76,31 @@ When the session starts, the white scan flash turns on. It stays on until the se
 
 ```
 Insert paper
-C:Scan D:Finish
+D:Finish
 ```
 
-When a page reaches the feeder entrance, the entrance IR sensor starts the conveyor belt. The Pi watches through its camera and pauses the belt when the page is framed (see [Conveyor](#conveyor)).
+Scanning is automatic, so you don't press anything per page:
 
-When the page is in place, press **`C`** to scan it:
+1. A page reaches the feeder entrance. The entrance IR sensor starts the belt.
 
-```
-Scanning page 1
-Please wait...
-```
+   ```
+   Feeding page 1
+   D:Finish
+   ```
 
-The ESP32 waits for the Pi to reply. Wait for the result before you press `C` again.
+2. The Pi watches through its camera and stops the belt the moment the page is centred (see [Conveyor](#conveyor)).
+3. The ESP32 asks the Pi to scan the page:
 
-| Pi reply | LCD | What to do |
+   ```
+   Scanning page 1
+   Please wait...
+   ```
+
+| Result | LCD | What to do |
 |---|---|---|
-| Page captured | `Page 1 scanned!` / `C:Next D:Finish` | Put in the next page and press `C`, or press `D` to finish |
-| Page failed | `Failed. Pages:0` / `C:Retry D:Finish` | Press `C` to retry the same page, or `D` to finish |
+| Page captured | `Page 1 scanned!` / `D:Finish` | Insert the next page, or press `D` to finish |
+| Page failed | `Failed. Pages:0` / `C:Retry D:Finish` | Press `C` to scan the same page again, or `D` to finish |
+| Pi never saw the page centred (10 s) | `Page not found` / `C:Scan D:Finish` | Press `C` to scan whatever is under the camera, or `D` to finish |
 
 `Pages:` shows how many pages were captured successfully in this session.
 
@@ -138,7 +145,7 @@ Keys you press during the `D` wind-down (in either mode) are saved and run after
 | Goal | Keys |
 |---|---|
 | Shred only | `#` `2`, feed pages, then `D` |
-| Scan & shred | `#` `1`, 10-key PIN, the same PIN again, then for each page insert it and press `C`, then `D` |
+| Scan & shred | `#` `1`, 10-key PIN, the same PIN again, then insert pages one by one, then `D` |
 | Cancel | `A` (not during PIN entry) |
 
 ## Background features
@@ -154,14 +161,14 @@ These run while you use the keypad and LCD.
 | Direction | Command | When |
 |---|---|---|
 | ESP32 → Pi | `SCANMODE,<id>,<PIN as hex>` | PIN confirmed; scan session opens |
-| ESP32 → Pi | `SCAN,<id>` | `C` pressed; capture a page |
+| ESP32 → Pi | `SCAN,<id>` | Page stopped under the camera (or `C` pressed); capture it |
 | ESP32 → Pi | `SCAN_DONE,<id>` | `D` pressed; close the file |
 | ESP32 → Pi | `CONV_START,<id>` | Paper reached the entrance; belt started, watch for framing |
 | ESP32 → Pi | `CONV_TIMEOUT,<id>` | Belt fed for 10 s without `CONV_PAUSE`; stopped for safety |
 | ESP32 → Pi | `PULP_DONE,<id>` | Pulping cycle finished |
 | Pi → ESP32 | `SCAN_ACK,...` | Page captured |
 | Pi → ESP32 | `NACK,...` | Page failed |
-| Pi → ESP32 | `CONV_PAUSE,<id>` | Page is framed for the camera; pause the belt |
+| Pi → ESP32 | `CONV_PAUSE,<id>` | Page is centred under the camera; stop the belt and scan |
 | Pi → ESP32 | `PULP,<id>` | Run the pulper |
 
 The PIN is sent as hex-encoded ASCII (20 characters, e.g. `1A#` → `314123`), because `*` is the NMEA checksum delimiter and would break the frame. On the Pi, decode it with `bytes.fromhex(pin_hex).decode()`.
@@ -185,7 +192,7 @@ GPIO 13 drives the white flash LED through a transistor. It is on for the whole 
 - The belt reacts when paper *arrives* at the entrance (3 readings in a row, about 60 ms). It runs only during a session, in either mode.
 - **Scan & Shred:** the ESP32 runs the belt. The Pi's only job is to say when to pause.
   1. **Feed:** paper arrives, the belt starts, and the ESP32 sends `CONV_START`.
-  2. **Pause:** the Pi sends `CONV_PAUSE` when the page is framed. The belt stops and holds the page. If no pause comes within 10 s, the belt stops and the ESP32 sends `CONV_TIMEOUT`.
+  2. **Pause:** the Pi sends `CONV_PAUSE` when the page is centred. The ESP32 cuts the motor as soon as it reads the message, holds the page and sends `SCAN`. If no pause comes within 10 s, the belt stops, the ESP32 sends `CONV_TIMEOUT` and the LCD shows `Page not found`.
   3. **Eject:** after `SCAN_ACK`, the ESP32 runs the belt for 5 s to carry the page to the shredder. After a `NACK` the page stays in place so you can retry with `C`.
   - A page that arrives while one is held or being ejected is fed in automatically once the eject ends.
 - **Shred only:** the Pi isn't involved. Each arriving page runs the belt for 5 s (restarting the 5 s if it's already running) and starts the shredder. Pi conveyor commands are ignored.
@@ -213,7 +220,7 @@ GPIO 13 drives the white flash LED through a transistor. It is on for the whole 
 
 - An IR LED on GPIO 10 sends a looping 38 kHz NEC frame to a VS1838 receiver on GPIO 9.
 - `irBeamPresent()` returns false when paper blocks the beam.
-- The beam runs all the time, but nothing uses it yet. It is meant to replace the manual `C` trigger and to drive the feeder rollers.
+- The beam runs all the time, but nothing uses it yet.
 
 ### FreeRTOS tasks
 
@@ -246,7 +253,7 @@ GPIO 13 drives the white flash LED through a transistor. It is on for the whole 
 
 ## Not implemented yet
 
-- The IR break-beam is not used yet, and `C` is still the manual scan trigger.
+- The IR break-beam is not used yet.
 - Pulper hardware: relay, water fill, door servo. The code is written but commented out. Pulping is a timed placeholder.
 
 ## Build
