@@ -10,7 +10,7 @@ ESP32-S3 controller for PULP, a paper shredder and pulper that can scan pages fi
 ┌───┬───┬───┬───┐
 │ 1 │ 2 │ 3 │ A │   A = Cancel (any screen except PIN entry)
 ├───┼───┼───┼───┤
-│ 4 │ 5 │ 6 │ B │   B = not used
+│ 4 │ 5 │ 6 │ B │   B = Pi link check (standby)
 ├───┼───┼───┼───┤
 │ 7 │ 8 │ 9 │ C │   C = Manual scan (only when a scan fails or a page is missed)
 ├───┼───┼───┼───┤
@@ -30,6 +30,18 @@ The device starts here and comes back here when a job ends or is cancelled.
 | Press | Result |
 |---|---|
 | `#` | Opens the mode menu |
+| `B` | Shows the Pi link counters for 3 s (see below) |
+
+`B` shows what has arrived from the Pi on the UART since power-up:
+
+```
+Pi RX B:1234
+ok:12 bad:0
+```
+
+- `B:` is the bytes received, `ok` the valid frames, `bad` the broken ones.
+- **All zero after the Pi has sent something:** nothing reaches the ESP32's RX (GPIO 12). Check the wire from the Pi's TX (GPIO14).
+- **`bad` going up:** a signal arrives but is garbled. Check the common GND and the baud rate.
 
 ### 2. Mode menu
 
@@ -156,7 +168,7 @@ These run while you use the keypad and LCD.
 
 - The ESP32 uses Serial1, TX GPIO 11 → Pi RX (GPIO15) and RX GPIO 12 ← Pi TX (GPIO14), at 115200 baud.
 - Messages are NMEA-0183-style frames: `$CMD,<id>,<args...>*<XOR checksum>\r\n`. `<id>` is a random message ID.
-- Frames are also copied to the native USB port and the UART-bridge USB port for monitoring. The ESP32 also accepts Pi replies on those ports, so you can test from a PC without a Pi.
+- Frames are also copied to the native USB port and the UART-bridge USB port for monitoring. Every line received from the Pi is printed on the native USB port as `[rx ok] ...`, or `[rx bad] ...` when the frame is broken or its checksum is wrong. The ESP32 also accepts Pi replies on those ports, so you can test from a PC without a Pi.
 
 | Direction | Command | When |
 |---|---|---|
@@ -164,12 +176,15 @@ These run while you use the keypad and LCD.
 | ESP32 → Pi | `SCAN,<id>` | Page stopped under the camera (or `C` pressed); capture it |
 | ESP32 → Pi | `SCAN_DONE,<id>` | `D` pressed; close the file |
 | ESP32 → Pi | `CONV_START,<id>` | Paper reached the entrance; belt started, watch for framing |
+| ESP32 → Pi | `PAGE_IN,<id>` | A sheet reached the entrance sensor (scan or shred only); the Pi counts sheets shredded |
 | ESP32 → Pi | `CONV_TIMEOUT,<id>` | Belt fed for 10 s without `CONV_PAUSE`; stopped for safety |
-| ESP32 → Pi | `PULP_DONE,<id>` | Pulping cycle finished |
+| ESP32 → Pi | `PULP_DONE,<id>,ok\|water_low` | Pulping cycle finished; `water_low` when the pump was skipped |
 | Pi → ESP32 | `SCAN_ACK,...` | Page captured |
 | Pi → ESP32 | `NACK,...` | Page failed |
+| ESP32 → Pi | `STATUS_REPORT,<id>,...` | Telemetry: every second, right away on a change, and in reply to `STATUS` (see [`STATUS_REPORT`](#status_report)) |
 | Pi → ESP32 | `CONV_PAUSE,<id>` | Page is centred under the camera; stop the belt and scan |
 | Pi → ESP32 | `PULP,<id>` | Run the pulper |
+| Pi → ESP32 | `FLASH`, `CONV_RUN`, `CONV_STOP`, `SHRED`, `SHRED_STOP`, `STATUS` | Direct control of the hardware (see [Actions](#actions)) |
 
 The PIN is sent as hex-encoded ASCII (20 characters, e.g. `1A#` → `314123`), because `*` is the NMEA checksum delimiter and would break the frame. On the Pi, decode it with `bytes.fromhex(pin_hex).decode()`.
 
@@ -183,12 +198,12 @@ The PIN is sent to the Pi once, in the `SCANMODE` frame. It is then wiped from t
 
 ### Scan flash
 
-GPIO 13 drives the white flash LED through a transistor. It is on for the whole scan session and turns off within about 20 ms after `D` or `A`.
+GPIO 13 drives the white flash LED through a transistor. It turns on when a scan session starts and off within about 20 ms after `D` or `A`. In between, or outside a session, the Pi's `FLASH` command can switch it, and it stays as set until the next session start or end.
 
 ### Conveyor
 
-- A TCRT5000 IR module at the feeder entrance (GPIO 40, LOW = paper present) detects incoming paper.
-- The motor driver's ENA pin is on GPIO 41 and gets PWM duty 100 by default. Direction pins (IN1/IN2) are not controlled by the ESP32, so wire them for forward.
+- A TCRT5000 IR module at the feeder entrance (GPIO 47, LOW = paper present) detects incoming paper.
+- The motor driver's ENA pin is on GPIO 41. Feeds and ejects run at PWM duty 70 by default. The Pi's `CONV_SPEED` changes it, and the ESP32 saves the new value in flash, so it survives a reboot or a reflash. Direction pins (IN1/IN2) are not controlled by the ESP32, so wire them for forward.
 - The belt reacts when paper *arrives* at the entrance (3 readings in a row, about 60 ms). It runs only during a session, in either mode.
 - **Scan & Shred:** the ESP32 runs the belt. The Pi's only job is to say when to pause.
   1. **Feed:** paper arrives, the belt starts, and the ESP32 sends `CONV_START`.
@@ -197,24 +212,52 @@ GPIO 13 drives the white flash LED through a transistor. It is on for the whole 
   - A page that arrives while one is held or being ejected is fed in automatically once the eject ends.
 - **Shred only:** the Pi isn't involved. Each arriving page runs the belt for 5 s (restarting the 5 s if it's already running) and starts the shredder. Pi conveyor commands are ignored.
 - `A` stops the belt immediately. `D` lets an eject that's already running finish.
-- Timings are `CONVEYOR_TIMEOUT_MS` and `CONVEYOR_EJECT_MS` in `src/main.cpp`.
+- In any state, the Pi can run the belt for a set time (`CONV_RUN`) or stop it (`CONV_STOP`). See [Actions](#actions).
+- Timings are `CONVEYOR_TIMEOUT_MS`, `CONVEYOR_EJECT_MS` and `CONVEYOR_MANUAL_MAX_MS` in `src/main.cpp`.
 
 ### Shredder
 
-- Relay on GPIO 42, HIGH = on.
+- Relay on GPIO 38, HIGH = on.
 - **When it starts:**
   - Scan & Shred: each page the Pi confirms (`SCAN_ACK`).
   - Shred only: each page the entrance sensor detects.
   - Either mode: once more when the session ends with `D` or `A`, to clear the chamber.
+  - Any state: the Pi's `SHRED` command (see [Actions](#actions)).
 - **Cycle:** on for 5 s, then a 3 s rest.
-  - A page during the 5 s restarts the 5 s; the times don't add up.
+  - A page during the 5 s restarts the 5 s; the times don't add up. In general, a new request during a run keeps it on until whichever end is later.
   - A page during the rest waits, and the shredder runs again as soon as the rest ends.
-- Timings are `SHREDDER_ON_MS` and `SHREDDER_REST_MS` in `src/main.cpp`.
+- Timings are `SHREDDER_ON_MS`, `SHREDDER_REST_MS` and `SHREDDER_MAX_MS` in `src/main.cpp`.
 
 ### Pulper
 
 - The pulper never runs on its own. It runs only when the Pi sends `PULP`, and the ESP32 replies `PULP_DONE` when the cycle ends.
-- For now the cycle is a 3 s placeholder. The relay, water fill and door servo code is written but commented out.
+- **Cycle (about 1 min 23 s; 1 min 18 s when the pump is skipped):**
+  1. **Door:** the servo opens it (90°) for 1 s, then closes it (0°).
+  2. **Water:** the pump runs for 5 s. It is **skipped when the water container is low** (see [Water container](#water-container)), so the pump never runs dry.
+  3. **Blend:** the blender runs 5 s, then rests 3 s, 10 times. There is no rest after the 10th run.
+  4. **Done:** the ESP32 sends `PULP_DONE,<id>,ok`, or `PULP_DONE,<id>,water_low` when the pump was skipped.
+- A `PULP` that arrives while a cycle is running is ignored.
+- The cycle runs in the background. The keypad and LCD keep working, and the LCD doesn't show it. `STATUS` reports which step it is on.
+- The door may twitch once at power-up: the servo library sends one 90° pulse before the firmware closes the door.
+- The servo needs its own 5 V supply, with GND shared with the ESP32. The ESP32's 3.3 V pin can't power it.
+- Timings are the `PULP_*` constants in `src/main.cpp`. The door angles are `DOOR_CLOSED_ANGLE` and `DOOR_OPEN_ANGLE` in `src/hardware.h`.
+
+### Water container
+
+- The water level sensor on GPIO 8 measures the container the pump draws from. The pump itself runs for a fixed time.
+- `WATER_SENSOR_ANALOG` in `src/hardware.h` picks the sensor type:
+  - `true` (default): analog strip module, read with the ADC.
+  - `false`: float switch to GND, read with a pull-up. LOW means water at the switch.
+- The level is read 5 times every 200 ms and the median is kept, so a single spike is ignored.
+- **Percentage:** the raw reading (0–4095) is scaled between `WATER_RAW_EMPTY` and `WATER_RAW_FULL` in `src/main.cpp`.
+- **Calibration:** check the `water raw` field of `STATUS_REPORT` with the sensor dry, then at the full mark, and set the two constants to those values.
+- **Low water:** the container counts as low below 20 % and as refilled above 25 %. The gap stops the state flickering around the threshold. While it's low, the pulper skips the pump.
+
+### Telemetry
+
+- `TelemetryTask` sends a `STATUS_REPORT` to the Pi every second, and right away (at most every 100 ms) when the machine's state changes: mode, belt, shredder, pulper, flash, entrance sensor, page count or low water.
+- The water percentage alone doesn't trigger an extra report, since it wobbles a little.
+- Fields are listed under [`STATUS_REPORT`](#status_report).
 
 ### IR break-beam
 
@@ -229,10 +272,96 @@ GPIO 13 drives the white flash LED through a transistor. It is on for the whole 
 | `MasterTask` | State machine: handles keys and Pi replies |
 | `KeypadTask` | Polls the keypad every 50 ms |
 | `LcdTask` | Draws screens requested through a queue |
-| `FeederTask` | Scan flash and page scan requests |
-| `ConveyorTask` | Entrance sensor, conveyor PWM and timeouts |
-| `ShredderTask` | Shredder relay: 5 s on / 3 s rest cycle |
-| `PulperTask` | Pulping cycle on the Pi's `PULP` command. It is simulated for now |
+| `FeederTask` | Scan flash at session start/end, and page scan requests |
+| `ConveyorTask` | Owns the belt: entrance sensor, feed/eject/Pi runs, timeouts |
+| `ShredderTask` | Owns the shredder relay: run / rest cycle |
+| `PulperTask` | Pulping cycle on the Pi's `PULP` command: door, water (skipped when low), blender |
+| `TelemetryTask` | Reads the water level and sends `STATUS_REPORT` every second and on changes |
+
+## Actions
+
+Every thing the machine can do is one function in the **Actions** section of `src/main.cpp`. The keypad flow (FreeRTOS tasks) and the Pi's commands call the same functions, so they share the same timers and safety limits. The task that owns a part (conveyor, shredder) still makes the final call. For example, a shredder request during the 3 s rest waits for the rest to end, whoever sent it.
+
+Below the actions, `src/hardware.h` holds the pin numbers and the raw pin I/O (`hwFlash()`, `hwConveyorDuty()`, `hwShredderRelay()`, `hwPaperAtEntrance()`). Only the actions and their owning tasks use them.
+
+### Function reference
+
+| Function | What it does | Pi command |
+|---|---|---|
+| `flashOn()` / `flashOff()` | Scan flash on / off. Stays as set until a scan session starts or ends | `FLASH,<id>,1` / `FLASH,<id>,0` |
+| `flashIsOn()` | Whether the flash is on | in `STATUS` |
+| `conveyorRun(ms, duty)` | Runs the belt for `ms` at PWM `duty` (0–255), in any state. Replaces whatever the belt was doing | `CONV_RUN,<id>[,<ms>[,<duty>]]` |
+| `conveyorSetSpeed(duty)` | Sets the belt speed (1–255) for feeds and ejects, saves it in flash, and applies it to a run in progress | `CONV_SPEED,<id>,<duty>` |
+| `conveyorStop()` | Stops the belt at once, in any state, and drops a page waiting to be fed | `CONV_STOP,<id>` |
+| `conveyorPauseForScan()` | Scan mode: the page is centred. Stops a feed at once and asks the Pi to scan | `CONV_PAUSE,<id>` |
+| `conveyorEject()` | Scan mode: carries the scanned page to the shredder (5 s) | — (sent after `SCAN_ACK`) |
+| `paperAtEntrance()` | Whether the entrance IR sensor sees paper | in `STATUS` |
+| `shredderRun(ms)` | Runs the shredder for `ms`, then the 3 s rest | `SHRED,<id>[,<ms>]` |
+| `shredderStop()` | Ends a run now (the rest still follows) and drops a pending one | `SHRED_STOP,<id>` |
+| `shredderBusy()` | Whether a run is pending or on | in `STATUS` |
+| `pulperRun()` | One pulping cycle, then `PULP_DONE`. Ignored while one runs | `PULP,<id>` |
+| `pulperBusy()` | Whether a pulping cycle is running | in `STATUS` |
+| `doorOpen()` / `doorClose()` | Pulper door servo to 90° / 0° | — |
+| `pumpOn()` / `pumpOff()` | Water pump on / off | — |
+| `waterIsLow()` | Whether the pump's water container is low | in `STATUS` |
+| `blenderOn()` / `blenderOff()` | Blender relay on / off | — |
+| `scanTrigger()` | Scan mode: asks the Pi to capture whatever is under the camera (`C` key) | — |
+| `sendStatus()` | Sends a `STATUS_REPORT` frame | `STATUS,<id>` |
+
+### Command arguments and limits
+
+- **Optional arguments:** a missing or non-numeric argument uses the default.
+- **`CONV_RUN`:** `ms` defaults to 5000 (`CONVEYOR_EJECT_MS`) and is capped at 30000 (`CONVEYOR_MANUAL_MAX_MS`). `duty` defaults to the saved belt speed. A duty above 255 also uses it.
+- **`SHRED`:** `ms` defaults to 5000 (`SHREDDER_ON_MS`) and is capped at 30000 (`SHREDDER_MAX_MS`).
+- **`FLASH`:** anything other than `0` or `1` is ignored.
+- **`CONV_SPEED`:** 1–255. Anything else is ignored.
+- **Unknown commands** are ignored. The ESP32 doesn't acknowledge commands; send `STATUS` to check the result.
+
+Example: run the belt 2 s at full speed, then read the state:
+
+```
+$CONV_RUN,1234,2000,255*<cs>
+$STATUS,1235*<cs>
+```
+
+### How commands mix with a session
+
+- **Flash:** the session turns it on at the start and off at the end. Anything the Pi sets in between holds until then.
+- **Belt:** `CONV_RUN` works in any state, even standby. During a scan session it takes over the belt:
+  - A page arriving while it runs is fed in after it ends.
+  - A feed it replaces is no longer watched for `CONV_PAUSE`.
+- **Stopping the belt:** `A` stops a Pi-started run too. Leaving a session (`A`, or `D` once its eject ends) doesn't stop a Pi run; it runs out its time.
+- **Shredder:** `SHRED` adds a run. The `D` wind-down waits for it, so `Shredding` lasts until the shredder stops.
+- **During the `D` wind-down:** Pi commands keep being handled.
+
+### `STATUS_REPORT`
+
+```
+STATUS_REPORT,<id>,<state>,<mode>,<flash>,<belt>,<duty>,<shredder>,<paper>,<pages>,<pulper>,<speed>,<water>,<water raw>,<water low>
+```
+
+| Field | Values |
+|---|---|
+| `state` | `standby`, `menu`, `pin`, `confirm_pin`, `processing`, `finishing` |
+| `mode` | `scan`, `shred` (during `processing`), otherwise `none` |
+| `flash` | `1` on, `0` off |
+| `belt` | `off`, `feed`, `eject`, `manual` |
+| `duty` | Current conveyor PWM duty, 0–255 |
+| `shredder` | `idle`, `on`, `rest` |
+| `paper` | `1` if the entrance sensor sees paper |
+| `pages` | Pages scanned in the current session |
+| `pulper` | `idle`, `door`, `water`, `blend`, `blend_rest` |
+| `speed` | Saved belt speed, 1–255 |
+| `water` | Water container level, 0–100 % |
+| `water raw` | Raw sensor reading, 0–4095, for calibration |
+| `water low` | `1` while the container is low (the pulper skips the pump) |
+
+### Adding an action
+
+1. Add the pin and its raw I/O to `hardware.h`.
+2. Add the action function to the **Actions** section of `main.cpp`. If a task owns the part, send the task a request instead of writing the pin.
+3. Add a case for the command in `handlePiPort()`.
+4. Document it here.
 
 ## Hardware / pinout
 
@@ -242,19 +371,18 @@ GPIO 13 drives the white flash LED through a transistor. It is on for the whole 
 | 4x4 keypad | Rows 15, 16, 17, 18; Columns 4, 5, 6, 7 |
 | Pi UART (Serial1) | TX 11, RX 12 |
 | Scan flash | 13 |
-| Entrance IR sensor (TCRT5000) | 40 |
+| Entrance IR sensor (TCRT5000) | 47 |
 | Conveyor motor driver ENA | 41 |
-| Shredder relay | 42 |
+| Shredder relay | 38 |
 | IR break-beam | RX 9, TX 10 |
-| Pulper relay *(planned)* | 14 |
-| Door servo *(planned)* | 21 |
-| Water level sensor *(planned)* | 8 |
-| Water pump *(planned)* | 39 |
+| Blender relay (pulper) | 14 |
+| Pulper door servo | 21 |
+| Water pump | 39 |
+| Water level sensor (pump's container) | 8 |
 
 ## Not implemented yet
 
 - The IR break-beam is not used yet.
-- Pulper hardware: relay, water fill, door servo. The code is written but commented out. Pulping is a timed placeholder.
 
 ## Build
 
