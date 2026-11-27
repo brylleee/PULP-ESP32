@@ -299,7 +299,7 @@ The admin dashboard on the Pi can turn the machine off and on (`POWER_OFF` / `PO
 - **Off:** the belt, shredder, pump, blender and flash stop at once, and a pulping cycle stops early (`PULP_DONE,<id>,aborted`) with the door opened again. A scan session in progress ends with `SCAN_DONE`, so the pages already scanned are kept. The LCD goes dark.
 - **While off:** Pi commands other than `POWER_ON`, `POWER_OFF`, `RESTART` and `STATUS` are ignored. `STATUS_REPORT` keeps coming, with state `off`. A key other than `#` lights the LCD for 5 s to show `Press # to start`.
 - **`#` turns it back on**, sends `POWER_ON` to the Pi, and pulls `PI_WAKE` (GPIO 40) LOW for 300 ms. Wired to the Pi's GPIO3 (header pin 5), that pulse starts a Pi that was shut down. Without the wire, a halted Pi needs its power unplugged and plugged back in.
-- **The off state is saved in flash,** so the machine stays off across a reboot until `#` or `POWER_ON`.
+- **The off state is not saved:** the ESP32 always boots on, in standby, without waiting for the Pi. When internals starts it re-applies the dashboard's power setting, so a machine switched off there goes off again once the Pi is up.
 - **`RESTART`** switches every output off and restarts the ESP32. The dashboard sends it when it restarts the Pi.
 
 ### Telemetry

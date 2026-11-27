@@ -176,9 +176,9 @@ See [Operational settings](#operational-settings) for the names, defaults and ra
 
 | Command | What it does |
 |---|---|
-| `/POWER_OFF` | Turns the machine off: belt, shredder, pump, blender and flash stop at once. A pulping cycle aborts (the door reopens). A scan session in progress ends, and its pages are kept. The LCD goes dark. The Pi stays on. Remembered across restarts |
+| `/POWER_OFF` | Turns the machine off: belt, shredder, pump, blender and flash stop at once. A pulping cycle aborts (the door reopens). A scan session in progress ends, and its pages are kept. The LCD goes dark. The Pi stays on. Not kept across an ESP32 restart: it always boots on |
 | `/POWER_ON` | Turns the machine back on, to standby |
-| `/RESTART` | Restarts the ESP32 (all outputs off first). Settings and the power state are kept |
+| `/RESTART` | Restarts the ESP32 (all outputs off first). Settings are kept; it comes back on |
 
 The dashboard's **Power** card does the same, and can also shut down or reboot the Pi. That needs the sudoers rule.
 

@@ -401,19 +401,13 @@ bool waterIsLow() { return waterLow; }
 void scanTrigger() { xSemaphoreGive(scanTriggerSem); }
 
 // Power. Off: belt, shredder, pulper, pump and flash stopped, LCD dark, Pi
-// commands ignored and the keypad too, except # (back on). Saved in flash,
-// so a reboot stays off. Telemetry keeps going.
-void savePowerOff(bool off) {
+// commands ignored and the keypad too, except # (back on). Telemetry keeps
+// going. Not saved: the ESP32 always boots on, in standby, with or without the
+// Pi. (Older firmware saved it as "off" in "pulp"; that key is dropped at boot.)
+void forgetSavedPowerOff() {
   prefs.begin("pulp", false);
-  prefs.putBool("off", off);
+  if (prefs.isKey("off")) prefs.remove("off");
   prefs.end();
-}
-
-bool savedPowerOff() {
-  prefs.begin("pulp", true);
-  bool off = prefs.getBool("off", false);
-  prefs.end();
-  return off;
 }
 
 void machinePowerOff() {
@@ -431,7 +425,6 @@ void machinePowerOff() {
   if (scanning) sendToPi("SCAN_DONE");  // the Pi keeps the pages scanned so far
   lcdLight = false;
   sendLcd(SCREEN_OFF);
-  savePowerOff(true);
 }
 
 // fromKeypad: # was pressed. Tells the Pi, and pulses PI_WAKE in case the Pi
@@ -441,7 +434,6 @@ void machinePowerOn(bool fromKeypad) {
   state = STATE_STANDBY;
   lcdLight = true;
   sendLcd(SCREEN_STANDBY);
-  savePowerOff(false);
   if (fromKeypad) {
     sendToPi("POWER_ON");
     hwPiWakePulse();
@@ -1095,16 +1087,11 @@ void finishSession() {
 
 // MASTER TASK: the keypad state machine, and the Pi's commands
 void MasterTask(void *pvParameters) {
-  if (savedPowerOff()) {
-    state = STATE_OFF;
-    lcdLight = false;
-    sendLcd(SCREEN_OFF);
-  } else {
-    state = STATE_STANDBY;
-    sendLcd(SCREEN_STANDBY);
-  }
   char key;
   uint32_t offLightAt = 0;
+  forgetSavedPowerOff();
+  state = STATE_STANDBY;  // always boots on, without waiting for the Pi
+  sendLcd(SCREEN_STANDBY);
 
   for (;;) {
     if (xQueueReceive(keyQueue, &key, pdMS_TO_TICKS(10))) {
