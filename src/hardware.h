@@ -24,10 +24,18 @@ constexpr uint8_t SHREDDER_RELAY_PIN = 38;  // was 42 (dead)
 constexpr uint8_t PULPER_RELAY_PIN = 14;  // blender relay
 constexpr uint8_t PULPER_SERVO_PIN = 21;  // door servo
 constexpr uint8_t WATER_PUMP_PIN = 39;
-constexpr uint8_t WATER_LEVEL_PIN = 8;    // level of the container the pump draws from
-// true: analog strip module (ADC, higher = more water)
-// false: float switch to GND (LOW = water at the switch)
-constexpr bool WATER_SENSOR_ANALOG = true;
+// On/off water sensor at the very bottom of the container the pump draws
+// from: a 3-wire module on 5 V, NPN open-collector output. It pulls the pin LOW
+// while it detects water and lets go when the container is empty, so the pin
+// is pulled up (to 3.3 V: safe with a 5 V module). A loose wire reads HIGH,
+// "no water", and the pump stays off. The Pi's WATER_ACTIVE flips the polarity
+// for a module that works the other way round (see waterSetActiveLevel()).
+constexpr uint8_t WATER_SENSOR_PIN = 8;
+
+// Pi wake: pulled LOW for a moment to start a halted Pi. Wire it to the Pi's
+// GPIO3 (header pin 5); harmless when not wired. Open drain: never driven HIGH.
+constexpr uint8_t PI_WAKE_PIN = 40;
+constexpr uint32_t PI_WAKE_PULSE_MS = 300;
 
 constexpr uint8_t DOOR_CLOSED_ANGLE = 0;
 constexpr uint8_t DOOR_OPEN_ANGLE = 90;
@@ -38,7 +46,7 @@ static Servo doorServo;
 static volatile bool hwFlashState = false;
 static volatile uint8_t hwDutyState = 0;
 static volatile bool hwShredderState = false;
-static volatile uint8_t hwDoorState = DOOR_CLOSED_ANGLE;
+static volatile uint8_t hwDoorState = DOOR_OPEN_ANGLE;
 static volatile bool hwPumpState = false;
 static volatile bool hwBlenderState = false;
 
@@ -65,11 +73,7 @@ static inline bool hwShredderRelayIsOn() { return hwShredderState; }
 
 static inline bool hwPaperAtEntrance() { return digitalRead(ENTRANCE_IR_PIN) == LOW; }
 
-// 0-4095 (a float switch reads 0 or 4095)
-static inline uint16_t hwWaterRaw() {
-  if (WATER_SENSOR_ANALOG) return analogRead(WATER_LEVEL_PIN);
-  return digitalRead(WATER_LEVEL_PIN) == LOW ? 4095 : 0;
-}
+static inline bool hwWaterPinHigh() { return digitalRead(WATER_SENSOR_PIN) == HIGH; }
 
 static inline void hwDoorAngle(uint8_t degrees) {
   hwDoorState = degrees;
@@ -92,7 +96,23 @@ static inline void hwBlender(bool on) {
 
 static inline bool hwBlenderIsOn() { return hwBlenderState; }
 
-// All outputs off, door closed
+static inline void hwPiWakePulse() {
+  digitalWrite(PI_WAKE_PIN, LOW);
+  pinMode(PI_WAKE_PIN, OUTPUT);
+  delay(PI_WAKE_PULSE_MS);
+  pinMode(PI_WAKE_PIN, INPUT);
+}
+
+// Everything that moves or lights up off, at once
+static inline void hwAllOff() {
+  hwConveyorDuty(0);
+  hwShredderRelay(false);
+  hwPump(false);
+  hwBlender(false);
+  hwFlash(false);
+}
+
+// All outputs off, door open (its resting position)
 static inline void hardwareInit() {
   pinMode(SCAN_FLASH_PIN, OUTPUT);
   hwFlash(false);
@@ -104,19 +124,16 @@ static inline void hardwareInit() {
   pinMode(SHREDDER_RELAY_PIN, OUTPUT);
   hwShredderRelay(false);
 
+  pinMode(PI_WAKE_PIN, INPUT);  // released
+
   pinMode(PULPER_RELAY_PIN, OUTPUT);
   hwBlender(false);
   pinMode(WATER_PUMP_PIN, OUTPUT);
   hwPump(false);
-  if (WATER_SENSOR_ANALOG) {
-    analogReadResolution(12);
-    analogSetPinAttenuation(WATER_LEVEL_PIN, ADC_11db);  // full 0-3.3 V range
-  } else {
-    pinMode(WATER_LEVEL_PIN, INPUT_PULLUP);
-  }
-  // attach() starts at 90 deg, so the door may twitch at boot
+  pinMode(WATER_SENSOR_PIN, INPUT_PULLUP);
+  // attach() starts at 90 deg (open), the door's resting position
   ESP32PWM::allocateTimer(1);  // timer 0 is the IR carrier
   doorServo.setPeriodHertz(50);
   doorServo.attach(PULPER_SERVO_PIN, 500, 2500);  // us for 0-180 deg
-  hwDoorAngle(DOOR_CLOSED_ANGLE);
+  hwDoorAngle(DOOR_OPEN_ANGLE);
 }

@@ -14,6 +14,10 @@
 
 constexpr uint8_t LCD_ADDR = 0x27;
 constexpr uint8_t LCD_COLS = 16;
+constexpr uint8_t LCD_SDA_PIN = 1;
+constexpr uint8_t LCD_SCL_PIN = 2;
+constexpr uint16_t LCD_I2C_TIMEOUT_MS = 20;
+constexpr uint32_t LCD_RETRY_MS = 250;  // redraw this often while the LCD doesn't answer
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, 2);
 
 const byte rows = 4;
@@ -40,32 +44,57 @@ const char SCAN_TRIGGER_KEY = 'C';  // manual scan
 const uint8_t PIN_LENGTH = 10;
 const uint32_t LCD_REFRESH_MS = 2000;
 
-// Conveyor
-const uint8_t CONVEYOR_DEFAULT_SPEED = 70;      // PWM duty, 0-255; CONV_SPEED overrides
-const uint32_t CONVEYOR_TIMEOUT_MS = 10000;     // feed gives up if no CONV_PAUSE
-const uint32_t CONVEYOR_EJECT_MS = 5000;        // carry page to the shredder
+// Fixed limits
 const uint32_t CONVEYOR_MANUAL_MAX_MS = 30000;  // CONV_RUN cap
 const uint8_t ENTRANCE_DEBOUNCE_POLLS = 3;
-
-// Shredder: run, then rest
-const uint32_t SHREDDER_ON_MS = 5000;
-const uint32_t SHREDDER_REST_MS = 3000;
 const uint32_t SHREDDER_MAX_MS = 30000;  // SHRED cap
 
-// Pulper cycle
-const uint32_t PULP_DOOR_OPEN_MS = 1000;
-const uint32_t PULP_WATER_MS = 5000;
-const uint32_t PULP_BLEND_ON_MS = 5000;
-const uint32_t PULP_BLEND_REST_MS = 3000;
-const uint8_t PULP_BLEND_RUNS = 10;
+// Adjustable settings, kept in flash (Preferences namespace "settings"), so
+// they survive reboots and reflashes. From the Pi:
+//   SET,<id>,<name>,<value>  saves one; the board answers SETTING (or SETTING_ERR)
+//   UNSET,<id>,<name>        back to the default; answers SETTING
+//   GET,<id>[,<name>]        answers SETTING,<id>,<name>,<value>,<default>,<min>,<max>
+//                            for that one, or for all of them
+// A new value applies from the next time it is used (the belt speed at once).
+enum SettingId : uint8_t {
+  SET_PULP_WATER_MS, SET_PULP_CLOSE_MS, SET_PULP_BLEND_MS, SET_PULP_REST_MS, SET_PULP_BLENDS,
+  SET_PULP_SETTLE_MS,
+  SET_SHRED_MS, SET_SHRED_REST_MS,
+  SET_BELT_SPEED, SET_BELT_STOP_MS, SET_BELT_EJECT_MS, SET_BELT_SHRED_MS, SET_FEED_TIMEOUT_MS,
+  SET_DOOR_OPEN_DEG, SET_DOOR_CLOSED_DEG,
+  SET_WATER_HIGH,
+  SETTING_COUNT
+};
+struct SettingDef {
+  const char *name;  // also the flash key: 15 characters at most
+  uint32_t def, min, max;
+};
+const SettingDef SETTINGS[SETTING_COUNT] = {
+  /* PULP_WATER_MS   */ {"pulp_water_ms", 12000, 0, 60000},     // pump run
+  /* PULP_CLOSE_MS   */ {"pulp_close_ms", 1000, 0, 10000},      // door closing, before the blender
+  /* PULP_BLEND_MS   */ {"pulp_blend_ms", 5000, 500, 60000},    // each blender run
+  /* PULP_REST_MS    */ {"pulp_rest_ms", 3000, 0, 60000},       // between blender runs
+  /* PULP_BLENDS     */ {"pulp_blends", 5, 1, 50},              // blender runs per cycle
+  /* PULP_SETTLE_MS  */ {"pulp_settle_ms", 5000, 0, 60000},     // after the last run, before the door opens
+  /* SHRED_MS        */ {"shred_ms", 10000, 1000, 30000},       // shredder run: both modes, D, SHRED's default
+  /* SHRED_REST_MS   */ {"shred_rest_ms", 3000, 0, 30000},      // shredder rest after a run
+  /* BELT_SPEED      */ {"belt_speed", 70, 1, 255},             // PWM duty for feeds and ejects
+  /* BELT_STOP_MS    */ {"belt_stop_ms", 175, 0, 5000},         // scan feed: run on after the page clears the IR
+  /* BELT_EJECT_MS   */ {"belt_eject_ms", 5000, 500, 30000},    // scan: carry the page to the shredder
+  /* BELT_SHRED_MS   */ {"belt_shred_ms", 10000, 500, 30000},   // shred only: carry each page to the shredder
+  /* FEED_TIMEOUT_MS */ {"feed_timeout_ms", 10000, 2000, 30000}, // a feed gives up (Page not found)
+  /* DOOR_OPEN_DEG   */ {"door_open_deg", 90, 0, 180},          // pulper door servo, open (at rest)
+  /* DOOR_CLOSED_DEG */ {"door_closed_deg", 0, 0, 180},         // ... closed (while blending)
+  /* WATER_HIGH      */ {"water_high", 0, 0, 1},                // 1: the water sensor's HIGH means water
+};
+volatile uint32_t settingValue[SETTING_COUNT];
+static inline uint32_t cfg(SettingId id) { return settingValue[id]; }
 
-// Water container the pump draws from. Calibrate EMPTY/FULL from the raw
-// value in STATUS_REPORT with the sensor dry and at the full mark.
-const uint16_t WATER_RAW_EMPTY = 150;
-const uint16_t WATER_RAW_FULL = 1800;
-const uint8_t WATER_LOW_PERCENT = 20;   // below: low, the pulper skips the pump
-const uint8_t WATER_OK_PERCENT = 25;    // above: ok again (no flicker in between)
+// Water sensor (on/off, at the bottom of the container the pump draws from).
+// A new reading counts once it held for WATER_STABLE_SAMPLES in a row, so
+// ripples from the pump don't flip it.
 const uint32_t WATER_SAMPLE_MS = 200;
+const uint8_t WATER_STABLE_SAMPLES = 5;  // 1 s
 
 // STATUS_REPORT goes to the Pi this often, and right away on a change.
 const uint32_t TELEMETRY_PERIOD_MS = 1000;
@@ -77,9 +106,13 @@ enum SystemState {
   STATE_INPUT_PIN,
   STATE_CONFIRM_PIN,
   STATE_PROCESSING,
-  STATE_FINISHING      // after D
+  STATE_FINISHING,     // after D
+  STATE_OFF            // POWER_OFF: everything off, # turns it back on
 };
-const char *const STATE_NAMES[] = {"standby", "menu", "pin", "confirm_pin", "processing", "finishing"};
+const char *const STATE_NAMES[] = {"standby", "menu", "pin", "confirm_pin", "processing", "finishing", "off"};
+
+// Off: a key other than # lights the LCD this long
+const uint32_t OFF_LIGHT_MS = 5000;
 
 enum BeltMode : uint8_t {
   BELT_OFF,
@@ -123,6 +156,7 @@ enum LcdScreen {
   SCREEN_PULPING,
   SCREEN_DONE,
   SCREEN_LINK,         // B in standby: Pi RX counters
+  SCREEN_OFF,
   SCREEN_COUNT
 };
 
@@ -151,6 +185,7 @@ const LcdText LCD_TEXT[SCREEN_COUNT] = {
   /* PULPING     */ {0, "[=] PULP Status:", 4, "Pulping"},
   /* DONE        */ {0, "[=] PULP Status:", 6, "Done"},
   /* LINK        */ {0, "Pi RX B:", 0, "ok:"},
+  /* OFF         */ {2, "PULP is off", 0, "Press # to start"},
 };
 
 // RTOS handles
@@ -169,6 +204,10 @@ char PININPUT[PIN_LENGTH + 1];
 char confirmPIN[PIN_LENGTH + 1];
 volatile byte pinIndex = 0;  // written by Master, read by LCD
 volatile uint16_t pagesScanned = 0;
+volatile bool lcdLight = true;     // backlight; dark while off
+volatile bool pulpAbort = false;   // POWER_OFF stops a pulping cycle
+volatile bool lcdResetRequest = false;  // the Pi's LCD_RESET: full re-init on the next redraw
+volatile uint32_t lcdRecoveries = 0;    // times the LCD stopped answering and was brought back
 
 // Pi link counters (Serial1 only), shown with B
 volatile uint32_t piRxBytes = 0;
@@ -207,34 +246,84 @@ volatile BeltMode beltMode = BELT_OFF;  // owned by ConveyorTask
 
 // Belt speed for feeds and ejects, saved in flash
 Preferences prefs;
-volatile uint8_t conveyorSpeed = CONVEYOR_DEFAULT_SPEED;
 
 static void conveyorSend(ConveyorEventType type, uint32_t ms = 0, uint8_t duty = 0) {
   ConveyorEvent evt = {type, duty, ms};
   xQueueSend(conveyorEvtQueue, &evt, 0);
 }
 
-void conveyorLoadSpeed() {
+Preferences settingsPrefs;  // namespace "settings"; only MasterTask writes it
+
+int settingFind(const std::string &name) {
+  for (int i = 0; i < SETTING_COUNT; i++) {
+    if (name == SETTINGS[i].name) return i;
+  }
+  return -1;
+}
+
+// At boot. Values saved by older firmware (speed, stop_ms, water_high in
+// "pulp") are taken over until the setting is saved anew.
+void settingsLoad() {
   prefs.begin("pulp", true);
-  conveyorSpeed = prefs.getUChar("speed", CONVEYOR_DEFAULT_SPEED);
+  uint32_t legacySpeed = prefs.getUChar("speed", SETTINGS[SET_BELT_SPEED].def);
+  uint32_t legacyStop = prefs.getUShort("stop_ms", SETTINGS[SET_BELT_STOP_MS].def);
+  uint32_t legacyWater = prefs.getBool("water_high", false) ? 1 : 0;
   prefs.end();
+
+  settingsPrefs.begin("settings", true);
+  for (int i = 0; i < SETTING_COUNT; i++) {
+    const SettingDef &d = SETTINGS[i];
+    uint32_t fallback = i == SET_BELT_SPEED ? legacySpeed : i == SET_BELT_STOP_MS ? legacyStop
+                      : i == SET_WATER_HIGH ? legacyWater : d.def;
+    uint32_t v = settingsPrefs.isKey(d.name) ? settingsPrefs.getUInt(d.name, fallback) : fallback;
+    settingValue[i] = (v < d.min || v > d.max) ? d.def : v;
+  }
+  settingsPrefs.end();
 }
 
-// Also applies to a feed or eject already running
-void conveyorSetSpeed(uint8_t duty) {
-  if (duty == 0) return;
-  conveyorSpeed = duty;
-  if (beltMode == BELT_FEED || beltMode == BELT_EJECT) hwConveyorDuty(duty);
-  prefs.begin("pulp", false);
-  prefs.putUChar("speed", duty);
-  prefs.end();
+void sendSetting(int i) {
+  const SettingDef &d = SETTINGS[i];
+  sendToPi("SETTING", std::string(d.name), std::to_string(settingValue[i]), std::to_string(d.def),
+           std::to_string(d.min), std::to_string(d.max));
 }
 
-// ms = 0 means CONVEYOR_EJECT_MS, duty = 0 the saved speed.
+bool pulperBusy();
+
+// Applies a new value where it matters at once. old: the value before.
+static void settingApply(int i, uint32_t old) {
+  if (i == SET_BELT_SPEED && (beltMode == BELT_FEED || beltMode == BELT_EJECT)) {
+    hwConveyorDuty(cfg(SET_BELT_SPEED));
+  }
+  // A door resting open moves to the new open angle
+  if (i == SET_DOOR_OPEN_DEG && !pulperBusy() && hwDoorAngleNow() == old) {
+    hwDoorAngle(cfg(SET_DOOR_OPEN_DEG));
+  }
+}
+
+// false: out of range. save=false (UNSET) removes the saved value.
+bool settingSet(int i, uint32_t value, bool save = true) {
+  const SettingDef &d = SETTINGS[i];
+  if (value < d.min || value > d.max) return false;
+  uint32_t old = settingValue[i];
+  settingValue[i] = value;
+  settingsPrefs.begin("settings", false);
+  if (save) settingsPrefs.putUInt(d.name, value); else settingsPrefs.remove(d.name);
+  settingsPrefs.end();
+  if (i == SET_BELT_SPEED || i == SET_BELT_STOP_MS || i == SET_WATER_HIGH) {
+    // also drop what older firmware saved, so UNSET really means the default
+    prefs.begin("pulp", false);
+    prefs.remove(i == SET_BELT_SPEED ? "speed" : i == SET_BELT_STOP_MS ? "stop_ms" : "water_high");
+    prefs.end();
+  }
+  settingApply(i, old);
+  return true;
+}
+
+// ms = 0 means belt_eject_ms, duty = 0 the saved speed.
 // Overrides the current belt mode.
 void conveyorRun(uint32_t ms = 0, uint8_t duty = 0) {
-  if (duty == 0) duty = conveyorSpeed;
-  if (ms == 0) ms = CONVEYOR_EJECT_MS;
+  if (duty == 0) duty = cfg(SET_BELT_SPEED);
+  if (ms == 0) ms = cfg(SET_BELT_EJECT_MS);
   if (ms > CONVEYOR_MANUAL_MAX_MS) ms = CONVEYOR_MANUAL_MAX_MS;
   conveyorSend(CONV_EVT_RUN, ms, duty);
 }
@@ -261,9 +350,9 @@ volatile uint32_t shredRequestMs = 0;
 volatile bool shredStopRequest = false;
 volatile ShredPhase shredPhase = SHRED_IDLE;
 
-// ms = 0 means SHREDDER_ON_MS. Waits out a rest if one is running.
+// ms = 0 means shred_ms. Waits out a rest if one is running.
 void shredderRun(uint32_t ms = 0) {
-  if (ms == 0) ms = SHREDDER_ON_MS;
+  if (ms == 0) ms = cfg(SET_SHRED_MS);
   if (ms > SHREDDER_MAX_MS) ms = SHREDDER_MAX_MS;
   taskENTER_CRITICAL(&shredMux);
   shredRequest = true;
@@ -290,8 +379,8 @@ bool shredderBusy() {
 // Pulper
 volatile PulpPhase pulpPhase = PULP_IDLE;  // owned by PulperTask
 
-void doorOpen()  { hwDoorAngle(DOOR_OPEN_ANGLE); }
-void doorClose() { hwDoorAngle(DOOR_CLOSED_ANGLE); }
+void doorOpen()  { hwDoorAngle(cfg(SET_DOOR_OPEN_DEG)); }
+void doorClose() { hwDoorAngle(cfg(SET_DOOR_CLOSED_DEG)); }
 void pumpOn()    { hwPump(true); }
 void pumpOff()   { hwPump(false); }
 void blenderOn() { hwBlender(true); }
@@ -304,17 +393,71 @@ void pulperRun() {
   if (!pulperBusy()) xTaskNotifyGive(pulperTaskHandle);
 }
 
-// Water level, kept up to date by TelemetryTask
-volatile uint16_t waterRaw = 0;
-volatile uint8_t waterPercent = 0;
-volatile bool waterLow = true;  // until the first reading
+// Water in the container, kept up to date by TelemetryTask
+volatile bool waterLow = true;  // no water at the sensor; true until the first reading
 bool waterIsLow() { return waterLow; }
 
 // Scan whatever is under the camera
 void scanTrigger() { xSemaphoreGive(scanTriggerSem); }
 
+// Power. Off: belt, shredder, pulper, pump and flash stopped, LCD dark, Pi
+// commands ignored and the keypad too, except # (back on). Saved in flash,
+// so a reboot stays off. Telemetry keeps going.
+void savePowerOff(bool off) {
+  prefs.begin("pulp", false);
+  prefs.putBool("off", off);
+  prefs.end();
+}
+
+bool savedPowerOff() {
+  prefs.begin("pulp", true);
+  bool off = prefs.getBool("off", false);
+  prefs.end();
+  return off;
+}
+
+void machinePowerOff() {
+  if (state == STATE_OFF) return;
+  bool scanning = state == STATE_PROCESSING && SCAN_MODE;
+  state = STATE_OFF;
+  SCAN_MODE = 0;
+  pinIndex = 0;
+  memset(PININPUT, 0, sizeof(PININPUT));
+  memset(confirmPIN, 0, sizeof(confirmPIN));
+  conveyorStop();
+  shredderStop();
+  if (pulperBusy()) pulpAbort = true;
+  hwAllOff();  // now; the tasks catch up within 50 ms
+  if (scanning) sendToPi("SCAN_DONE");  // the Pi keeps the pages scanned so far
+  lcdLight = false;
+  sendLcd(SCREEN_OFF);
+  savePowerOff(true);
+}
+
+// fromKeypad: # was pressed. Tells the Pi, and pulses PI_WAKE in case the Pi
+// is halted.
+void machinePowerOn(bool fromKeypad) {
+  if (state != STATE_OFF) return;
+  state = STATE_STANDBY;
+  lcdLight = true;
+  sendLcd(SCREEN_STANDBY);
+  savePowerOff(false);
+  if (fromKeypad) {
+    sendToPi("POWER_ON");
+    hwPiWakePulse();
+  }
+}
+
+void machineRestart() {
+  hwAllOff();
+  Serial.flush();
+  delay(100);
+  ESP.restart();
+}
+
 // STATUS_REPORT,<id>,<state>,<mode>,<flash>,<belt>,<duty>,<shredder>,<paper>,<pages>,<pulper>,
-//               <speed>,<water %>,<water raw>,<water low>
+//               <speed>,<water>
+// <water>: 1 while the sensor detects water, 0 when the container is empty
 void sendStatus() {
   const char *mode = (state == STATE_PROCESSING) ? (SCAN_MODE ? "scan" : "shred") : "none";
   sendToPi("STATUS_REPORT",
@@ -327,15 +470,20 @@ void sendStatus() {
            std::to_string(paperAtEntrance() ? 1 : 0),
            std::to_string(pagesScanned),
            std::string(PULP_PHASE_NAMES[pulpPhase]),
-           std::to_string(conveyorSpeed),
-           std::to_string(waterPercent),
-           std::to_string(waterRaw),
-           std::to_string(waterLow ? 1 : 0));
+           std::to_string(cfg(SET_BELT_SPEED)),
+           std::to_string(waterLow ? 0 : 1));
 }
 
 // ---------------------------------------------------------------------
 // Pi commands
 // ---------------------------------------------------------------------
+
+// Argument after the message ID, as text ("" when missing)
+std::string nmeaArgText(NmeaNode *nmea, int index) {
+  NmeaNode *node = nmea->next ? nmea->next->next : nullptr;
+  for (int i = 0; node && i < index; i++) node = node->next;
+  return node ? node->token : std::string();
+}
 
 // Argument after the message ID, as an unsigned int
 bool nmeaArgUint(NmeaNode *nmea, int index, uint32_t &out) {
@@ -368,7 +516,19 @@ void handlePiPort(Stream &port) {
   const std::string &cmd = nmea->token;
   uint32_t a = 0, b = 0;
 
-  if (cmd == "SCAN_ACK") {
+  // Off: only the power commands and STATUS
+  if (state == STATE_OFF && cmd != "POWER_ON" && cmd != "POWER_OFF" && cmd != "RESTART" && cmd != "STATUS") {
+    freeNmeaList(nmea);
+    return;
+  }
+
+  if (cmd == "POWER_OFF") {
+    machinePowerOff();
+  } else if (cmd == "POWER_ON") {
+    machinePowerOn(false);
+  } else if (cmd == "RESTART") {
+    machineRestart();
+  } else if (cmd == "SCAN_ACK") {
     xTaskNotify(feederTaskHandle, PI_REPLY_ACK, eSetValueWithOverwrite);
   } else if (cmd == "NACK") {
     xTaskNotify(feederTaskHandle, PI_REPLY_NACK, eSetValueWithOverwrite);
@@ -383,7 +543,11 @@ void handlePiPort(Stream &port) {
     if (!nmeaArgUint(nmea, 1, b) || b > 255) b = 0;
     conveyorRun(a, (uint8_t)b);
   } else if (cmd == "CONV_SPEED") {
-    if (nmeaArgUint(nmea, 0, a) && a >= 1 && a <= 255) conveyorSetSpeed((uint8_t)a);
+    if (nmeaArgUint(nmea, 0, a)) settingSet(SET_BELT_SPEED, a);  // same as SET belt_speed
+  } else if (cmd == "WATER_ACTIVE") {  // 0: LOW means water, 1: HIGH means water
+    if (nmeaArgUint(nmea, 0, a)) settingSet(SET_WATER_HIGH, a);  // same as SET water_high
+  } else if (cmd == "CONV_STOP_MS") {
+    if (nmeaArgUint(nmea, 0, a)) settingSet(SET_BELT_STOP_MS, a);  // same as SET belt_stop_ms
   } else if (cmd == "CONV_STOP") {
     conveyorStop();
   } else if (cmd == "SHRED") {
@@ -393,8 +557,31 @@ void handlePiPort(Stream &port) {
     shredderStop();
   } else if (cmd == "PULP") {
     pulperRun();
+  } else if (cmd == "DOOR") {  // 1 = open, 0 = close; ignored mid-cycle
+    if (nmeaArgUint(nmea, 0, a) && a <= 1 && !pulperBusy()) {
+      if (a) doorOpen(); else doorClose();
+    }
   } else if (cmd == "STATUS") {
     sendStatus();
+  } else if (cmd == "SET" || cmd == "UNSET" || cmd == "GET") {
+    std::string name = nmeaArgText(nmea, 0);
+    int i = settingFind(name);
+    if (cmd == "GET" && name.empty()) {
+      for (int k = 0; k < SETTING_COUNT; k++) sendSetting(k);
+    } else if (i < 0) {
+      sendToPi("SETTING_ERR", name.empty() ? std::string("?") : name, std::string("unknown setting"));
+    } else if (cmd == "GET") {
+      sendSetting(i);
+    } else if (cmd == "UNSET") {
+      settingSet(i, SETTINGS[i].def, false);
+      sendSetting(i);
+    } else if (nmeaArgUint(nmea, 1, a) && settingSet(i, a)) {
+      sendSetting(i);
+    } else {
+      sendToPi("SETTING_ERR", name, "must be " + std::to_string(SETTINGS[i].min) + "-" + std::to_string(SETTINGS[i].max));
+    }
+  } else if (cmd == "LCD_RESET") {  // frees the I2C bus and re-inits the LCD
+    lcdResetRequest = true;
   }
 
   freeNmeaList(nmea);
@@ -417,8 +604,9 @@ void servePi() {
 static void lcdResync() {
   auto nibble = [](uint8_t n) {
     Wire.beginTransmission(LCD_ADDR);
-    Wire.write(n | LCD_BACKLIGHT | En);
-    Wire.write(n | LCD_BACKLIGHT);
+    uint8_t light = lcdLight ? LCD_BACKLIGHT : LCD_NOBACKLIGHT;
+    Wire.write(n | light | En);
+    Wire.write(n | light);
     Wire.endTransmission();
   };
   nibble(0x30); delayMicroseconds(4500);
@@ -431,6 +619,34 @@ static void lcdResync() {
   lcd.home();  // also undoes a display shift
 }
 
+// Relay and motor switching can also leave the LCD's I2C bus stuck (a device
+// holding SDA low mid-byte): every write then fails and the LCD keeps showing
+// the last screen. Clock SCL until SDA is let go, send a STOP, restart Wire.
+static void i2cRecover() {
+  Wire.end();
+  pinMode(LCD_SDA_PIN, INPUT_PULLUP);
+  pinMode(LCD_SCL_PIN, OUTPUT_OPEN_DRAIN);
+  digitalWrite(LCD_SCL_PIN, HIGH);
+  for (int i = 0; i < 9 && digitalRead(LCD_SDA_PIN) == LOW; i++) {
+    digitalWrite(LCD_SCL_PIN, LOW);
+    delayMicroseconds(5);
+    digitalWrite(LCD_SCL_PIN, HIGH);
+    delayMicroseconds(5);
+  }
+  pinMode(LCD_SDA_PIN, OUTPUT_OPEN_DRAIN);  // STOP: SDA rises while SCL is high
+  digitalWrite(LCD_SDA_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(LCD_SDA_PIN, HIGH);
+  delayMicroseconds(5);
+  Wire.begin(LCD_SDA_PIN, LCD_SCL_PIN);
+  Wire.setTimeOut(LCD_I2C_TIMEOUT_MS);
+}
+
+static bool lcdAnswers() {
+  Wire.beginTransmission(LCD_ADDR);
+  return Wire.endTransmission() == 0;
+}
+
 // Fill with spaces to the full width, so no clear() is needed
 static void lcdPad(char *line) {
   size_t n = strlen(line);
@@ -439,14 +655,30 @@ static void lcdPad(char *line) {
 }
 
 // LCD TASK: draws the screens the other tasks queue. Redraws the current one
-// every LCD_REFRESH_MS too, so a glitched display fixes itself.
+// every LCD_REFRESH_MS too, so a glitched display fixes itself. When the LCD
+// stops answering on I2C it frees the bus, re-inits it and retries often.
 void LcdTask(void *pvParameters) {
   LcdScreen screen = SCREEN_STANDBY;
   LcdScreen next;
   char top[LCD_COLS + 1], bottom[LCD_COLS + 1];
+  bool lcdOk = true;
 
   for (;;) {
-    if (xQueueReceive(lcdQueue, &next, pdMS_TO_TICKS(LCD_REFRESH_MS))) screen = next;
+    uint32_t wait = lcdOk ? LCD_REFRESH_MS : LCD_RETRY_MS;
+    if (xQueueReceive(lcdQueue, &next, pdMS_TO_TICKS(wait))) screen = next;
+
+    if (lcdResetRequest || !lcdAnswers()) {
+      bool requested = lcdResetRequest;
+      lcdResetRequest = false;
+      i2cRecover();
+      if (!lcdAnswers()) {  // still nothing: try again soon
+        lcdOk = false;
+        continue;
+      }
+      lcd.init();  // the controller may have lost its setup too
+      if (!requested) lcdRecoveries++;
+    }
+    lcdOk = true;
     const LcdText &text = LCD_TEXT[screen];
 
     int n = snprintf(top, sizeof(top), "%*s%s", text.topCol, "", text.top);
@@ -472,6 +704,7 @@ void LcdTask(void *pvParameters) {
 
     lcdPad(top);
     lcdPad(bottom);
+    if (lcdLight) lcd.backlight(); else lcd.noBacklight();
     lcdResync();
     lcd.setCursor(0, 0);
     lcd.print(top);
@@ -542,7 +775,7 @@ void FeederTask(void *pvParameters) {
 // SHREDDER TASK: owns the relay; runs, then rests
 void ShredderTask(void *pvParameters) {
   uint32_t phaseStartMs = 0;
-  uint32_t onMs = SHREDDER_ON_MS;
+  uint32_t onMs = cfg(SET_SHRED_MS);
 
   for (;;) {
     uint32_t now = millis();
@@ -555,7 +788,7 @@ void ShredderTask(void *pvParameters) {
         phaseStartMs = now;
       }
     }
-    if (shredPhase == SHRED_REST && now - phaseStartMs >= SHREDDER_REST_MS) {
+    if (shredPhase == SHRED_REST && now - phaseStartMs >= cfg(SET_SHRED_REST_MS)) {
       shredPhase = SHRED_IDLE;
     }
     if (shredRequest && shredPhase != SHRED_REST) {
@@ -580,27 +813,31 @@ void ShredderTask(void *pvParameters) {
 }
 
 // CONVEYOR TASK: owns the belt
-// Scan: paper in -> FEED + CONV_START -> CONV_PAUSE -> SCAN -> ACK -> EJECT.
+// Scan: paper in -> FEED + CONV_START,ir -> page clears the IR -> stop after
+// cfg(SET_BELT_STOP_MS) -> SCAN -> ACK -> EJECT. A CONV_PAUSE from the Pi
+// stops a feed early too.
 // Shred only: paper in -> EJECT + shredder.
 void ConveyorTask(void *pvParameters) {
   bool pageInFrame = false;   // held under the camera
   bool feedPending = false;   // next page waiting for the belt
   bool paperWasPresent = false;
   uint8_t presentPolls = 0;
+  uint8_t clearPolls = 0;
+  uint32_t clearSinceMs = 0;  // when the entrance IR last went clear
   uint32_t runStartMs = 0;
   uint32_t runMs = 0;
   ConveyorEvent evt;
 
   auto setMode = [&](BeltMode m, uint32_t ms = 0, uint8_t duty = 0) {
-    if (duty == 0) duty = conveyorSpeed;
+    if (duty == 0) duty = cfg(SET_BELT_SPEED);
     beltMode = m;
     runStartMs = millis();
     runMs = ms;
     hwConveyorDuty(m == BELT_OFF ? 0 : duty);
   };
   auto startFeed = [&]() {
-    setMode(BELT_FEED, CONVEYOR_TIMEOUT_MS);
-    sendToPi("CONV_START");
+    setMode(BELT_FEED, cfg(SET_FEED_TIMEOUT_MS));
+    sendToPi("CONV_START", std::string("ir"));  // "ir": the board stops the belt itself
     sendLcd(SCREEN_FEEDING);
   };
 
@@ -619,7 +856,7 @@ void ConveyorTask(void *pvParameters) {
           break;
         case CONV_EVT_EJECT:
           if (scanMode) {
-            setMode(BELT_EJECT, CONVEYOR_EJECT_MS);
+            setMode(BELT_EJECT, cfg(SET_BELT_EJECT_MS));
             pageInFrame = false;
           }
           break;
@@ -649,7 +886,7 @@ void ConveyorTask(void *pvParameters) {
       if (paperPresent && !paperWasPresent) {
         sendToPi("PAGE_IN");  // the Pi counts the sheets shredded
         if (!scanMode) {
-          setMode(BELT_EJECT, CONVEYOR_EJECT_MS);
+          setMode(BELT_EJECT, cfg(SET_BELT_SHRED_MS));
           shredderRun();
         } else if (beltMode == BELT_OFF && !pageInFrame) {
           startFeed();
@@ -658,6 +895,18 @@ void ConveyorTask(void *pvParameters) {
         }
       }
       paperWasPresent = paperPresent;
+
+      // Back edge past the IR: stop the feed a set time later. Timed from the
+      // first clear reading, confirmed by ENTRANCE_DEBOUNCE_POLLS of them.
+      bool clear = !paperAtEntrance();
+      if (clear && clearPolls == 0) clearSinceMs = millis();
+      clearPolls = clear ? min<uint8_t>(clearPolls + 1, ENTRANCE_DEBOUNCE_POLLS) : 0;
+      if (scanMode && beltMode == BELT_FEED && clearPolls >= ENTRANCE_DEBOUNCE_POLLS &&
+          millis() - clearSinceMs >= cfg(SET_BELT_STOP_MS)) {
+        setMode(BELT_OFF);
+        pageInFrame = true;
+        scanTrigger();
+      }
     }
 
     if (beltMode != BELT_OFF && millis() - runStartMs >= runMs) {
@@ -677,79 +926,93 @@ void ConveyorTask(void *pvParameters) {
   }
 }
 
-// PULPER TASK: door, water, blender bursts, then PULP_DONE,<id>,ok
-// (or water_low when the container was low and the pump was skipped)
+// PULPER TASK: water, door closes, blender bursts, door opens, then PULP_DONE,<id>,ok
+// The door stays open between cycles; it is closed only while the blender runs.
+// (or water_low when the container was empty: the pump was skipped, or
+// stopped as soon as the water ran out)
+// POWER_OFF ends the cycle early: PULP_DONE,<id>,aborted.
 void PulperTask(void *pvParameters) {
+  // Waits in short steps; false once POWER_OFF asked to stop
   auto phase = [](PulpPhase p, uint32_t ms) {
     pulpPhase = p;
-    vTaskDelay(pdMS_TO_TICKS(ms));
+    // The pump stops the moment the container runs dry
+    for (uint32_t waited = 0; waited < ms && !pulpAbort && !(p == PULP_WATER && waterIsLow()); waited += 50) {
+      vTaskDelay(pdMS_TO_TICKS(min<uint32_t>(50, ms - waited)));
+    }
+    return !pulpAbort;
   };
 
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    pulpAbort = false;
 
-    doorOpen();
-    phase(PULP_DOOR, PULP_DOOR_OPEN_MS);
-    doorClose();
+    bool going = true;
 
     // A pump must not run dry: skip it when the container is low.
     bool pumped = !waterIsLow();
     if (pumped) {
       pumpOn();
-      phase(PULP_WATER, PULP_WATER_MS);
+      going = phase(PULP_WATER, cfg(SET_PULP_WATER_MS));
       pumpOff();
     }
 
-    for (uint8_t run = 1; run <= PULP_BLEND_RUNS; run++) {
-      blenderOn();
-      phase(PULP_BLEND, PULP_BLEND_ON_MS);
-      blenderOff();
-      if (run < PULP_BLEND_RUNS) phase(PULP_BLEND_REST, PULP_BLEND_REST_MS);
+    if (going) {
+      doorClose();
+      going = phase(PULP_DOOR, cfg(SET_PULP_CLOSE_MS));
     }
+
+    const uint32_t runs = cfg(SET_PULP_BLENDS);
+    for (uint32_t run = 1; going && run <= runs; run++) {
+      blenderOn();
+      going = phase(PULP_BLEND, cfg(SET_PULP_BLEND_MS));
+      blenderOff();
+      if (going && run < runs) going = phase(PULP_BLEND_REST, cfg(SET_PULP_REST_MS));
+    }
+    if (going) going = phase(PULP_DOOR, cfg(SET_PULP_SETTLE_MS));  // let it settle, closed
+    doorOpen();  // also after an abort (at once): the blender is already off
 
     pulpPhase = PULP_IDLE;
     ulTaskNotifyTake(pdTRUE, 0);  // drop a PULP that came in mid-cycle
-    sendToPi("PULP_DONE", std::string(pumped ? "ok" : "water_low"));
+    bool ranDry = !pumped || waterIsLow();
+    const char *result = !going ? "aborted" : ranDry ? "water_low" : "ok";
+    pulpAbort = false;
+    sendToPi("PULP_DONE", std::string(result));
   }
 }
 
-// Median of 5 readings (ignores the odd spike), scaled to 0-100 %, with a
-// gap between the low and ok thresholds so the state doesn't flicker.
-void readWaterLevel(bool first) {
-  uint16_t r[5];
-  for (auto &v : r) v = hwWaterRaw();
-  std::sort(r, r + 5);
-  waterRaw = r[2];
-
-  int span = WATER_RAW_FULL - WATER_RAW_EMPTY;
-  int pct = span > 0 ? (int(r[2]) - WATER_RAW_EMPTY) * 100 / span : 0;
-  waterPercent = constrain(pct, 0, 100);
-
-  if (waterPercent < WATER_LOW_PERCENT) waterLow = true;
-  else if (waterPercent > WATER_OK_PERCENT) waterLow = false;
-  else if (first) waterLow = false;  // in the gap at boot: not low yet
+// Takes a new sensor state once it held WATER_STABLE_SAMPLES readings in a
+// row. first: the boot reading, taken as is.
+void readWaterSensor(bool first) {
+  static uint8_t streak = 0;
+  bool low = hwWaterPinHigh() != (cfg(SET_WATER_HIGH) != 0);  // no water
+  if (first || low == waterLow) {
+    waterLow = low;
+    streak = 0;
+  } else if (++streak >= WATER_STABLE_SAMPLES) {
+    waterLow = low;
+    streak = 0;
+  }
 }
 
 // Everything STATUS_REPORT carries that should trigger a report at once
-// (not the water percentage, which wobbles)
 std::array<uint16_t, 10> statusSnapshot() {
   return {(uint16_t)state, (uint16_t)SCAN_MODE, flashIsOn(), beltMode, hwConveyorDutyNow(),
           shredPhase, paperAtEntrance(), pulpPhase, waterLow, pagesScanned};
 }
 
-// TELEMETRY TASK: water level, and STATUS_REPORT every TELEMETRY_PERIOD_MS
+// TELEMETRY TASK: water sensor, and STATUS_REPORT every TELEMETRY_PERIOD_MS
 // and right away when the machine's state changes
 void TelemetryTask(void *pvParameters) {
   uint32_t lastSent = 0;
   uint32_t lastSample = millis();
-  readWaterLevel(true);
+  readWaterSensor(true);
   auto lastSnapshot = statusSnapshot();
 
   for (;;) {
     uint32_t now = millis();
     if (now - lastSample >= WATER_SAMPLE_MS) {
       lastSample = now;
-      readWaterLevel(false);
+      readWaterSensor(false);
     }
 
     auto snapshot = statusSnapshot();
@@ -822,6 +1085,7 @@ void finishSession() {
     vTaskDelay(pdMS_TO_TICKS(50));
     servePi();
   }
+  if (state == STATE_OFF) return;  // POWER_OFF came in meanwhile
 
   sendLcd(SCREEN_DONE);
   vTaskDelay(pdMS_TO_TICKS(2000));
@@ -831,15 +1095,30 @@ void finishSession() {
 
 // MASTER TASK: the keypad state machine, and the Pi's commands
 void MasterTask(void *pvParameters) {
-  state = STATE_STANDBY;
-  sendLcd(SCREEN_STANDBY);
+  if (savedPowerOff()) {
+    state = STATE_OFF;
+    lcdLight = false;
+    sendLcd(SCREEN_OFF);
+  } else {
+    state = STATE_STANDBY;
+    sendLcd(SCREEN_STANDBY);
+  }
   char key;
+  uint32_t offLightAt = 0;
 
   for (;;) {
     if (xQueueReceive(keyQueue, &key, pdMS_TO_TICKS(10))) {
       bool enteringPin = state == STATE_INPUT_PIN || state == STATE_CONFIRM_PIN;
 
-      if (key == 'A' && !enteringPin) {
+      if (state == STATE_OFF) {
+        if (key == '#') {
+          machinePowerOn(true);
+        } else {  // show how to turn it on
+          offLightAt = millis();
+          lcdLight = true;
+          sendLcd(SCREEN_OFF);
+        }
+      } else if (key == 'A' && !enteringPin) {
         // A cancels, except during PIN entry
         if (state == STATE_PROCESSING) shredderRun();  // clear the chamber
         conveyorStop();
@@ -875,6 +1154,11 @@ void MasterTask(void *pvParameters) {
       }
     }
 
+    if (state == STATE_OFF && lcdLight && millis() - offLightAt >= OFF_LIGHT_MS) {
+      lcdLight = false;
+      sendLcd(SCREEN_OFF);
+    }
+
     servePi();
   }
 }
@@ -885,10 +1169,12 @@ void setup() {
   Serial1.begin(115200, SERIAL_8N1, PI_UART_RX_PIN, PI_UART_TX_PIN);
 
   hardwareInit();
-  conveyorLoadSpeed();
+  settingsLoad();
+  hwDoorAngle(cfg(SET_DOOR_OPEN_DEG));  // the saved resting angle
   irInit();
 
-  Wire.begin(1, 2);
+  Wire.begin(LCD_SDA_PIN, LCD_SCL_PIN);
+  Wire.setTimeOut(LCD_I2C_TIMEOUT_MS);
   lcd.init();
   lcd.backlight();
 
